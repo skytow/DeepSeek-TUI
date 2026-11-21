@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
-//! Feature flags and metadata for DeepSeek TUI.
+//! Feature flags and metadata for codewhale.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Lifecycle stage for a feature flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,32 +44,15 @@ pub enum Feature {
     Mcp,
     /// Enable execpolicy integration/tooling.
     ExecPolicy,
+    /// Enable vision model for image analysis.
+    VisionModel,
+    /// Enable the agent-callable `verify` adversarial self-critique tool (#4196).
+    Verify,
 }
 
 impl fmt::Display for Stage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl Feature {
-    pub fn key(self) -> &'static str {
-        self.info().key
-    }
-
-    pub fn stage(self) -> Stage {
-        self.info().stage
-    }
-
-    pub fn default_enabled(self) -> bool {
-        self.info().default_enabled
-    }
-
-    fn info(self) -> &'static FeatureSpec {
-        FEATURES
-            .iter()
-            .find(|spec| spec.id == self)
-            .unwrap_or_else(|| unreachable!("missing FeatureSpec for {:?}", self))
     }
 }
 
@@ -116,12 +99,6 @@ impl Features {
             }
         }
     }
-
-    pub fn enabled_features(&self) -> Vec<Feature> {
-        let mut list: Vec<_> = self.enabled.iter().copied().collect();
-        list.sort();
-        list
-    }
 }
 
 /// Keys accepted in `[features]` tables.
@@ -134,10 +111,6 @@ pub fn feature_from_key(key: &str) -> Option<Feature> {
         .iter()
         .find(|spec| spec.key == key)
         .map(|spec| spec.id)
-}
-
-pub fn feature_spec_by_key(key: &str) -> Option<&'static FeatureSpec> {
-    FEATURES.iter().find(|spec| spec.key == key)
 }
 
 pub fn render_feature_table(features: &Features) -> String {
@@ -155,10 +128,50 @@ pub fn render_feature_table(features: &Features) -> String {
 }
 
 /// Deserializable features table for TOML.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub struct FeaturesToml {
     #[serde(flatten)]
     pub entries: BTreeMap<String, bool>,
+}
+
+impl<'de> Deserialize<'de> for FeaturesToml {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+        let mut entries = BTreeMap::new();
+
+        for (key, value) in raw {
+            match value {
+                toml::Value::Boolean(enabled) => {
+                    entries.insert(key, enabled);
+                }
+                toml::Value::Table(table) if key == "enabled" => {
+                    for (feature_key, feature_value) in table {
+                        match feature_value {
+                            toml::Value::Boolean(enabled) => {
+                                entries.insert(feature_key, enabled);
+                            }
+                            other => {
+                                return Err(de::Error::custom(format!(
+                                    "features.enabled.{feature_key} must be a boolean, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                other if is_known_feature_key(&key) => {
+                    return Err(de::Error::custom(format!(
+                        "features.{key} must be a boolean, got {other:?}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self { entries })
+    }
 }
 
 /// Single registry of all feature definitions.
@@ -180,31 +193,43 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Subagents,
         key: "subagents",
-        stage: Stage::Experimental,
+        stage: Stage::Stable,
         default_enabled: true,
     },
     FeatureSpec {
         id: Feature::WebSearch,
         key: "web_search",
-        stage: Stage::Experimental,
+        stage: Stage::Stable,
         default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ApplyPatch,
         key: "apply_patch",
-        stage: Stage::Experimental,
+        stage: Stage::Stable,
         default_enabled: true,
     },
     FeatureSpec {
         id: Feature::Mcp,
         key: "mcp",
-        stage: Stage::Experimental,
+        stage: Stage::Stable,
         default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ExecPolicy,
         key: "exec_policy",
-        stage: Stage::Experimental,
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::VisionModel,
+        key: "vision_model",
+        stage: Stage::Beta,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Verify,
+        key: "verify_tool",
+        stage: Stage::Stable,
         default_enabled: true,
     },
 ];
@@ -239,6 +264,6 @@ mod tests {
 
         assert_eq!(lines.first(), Some(&"feature\tstage\tenabled"));
         assert!(lines.contains(&"shell_tool\tstable\ttrue"));
-        assert!(lines.contains(&"mcp\texperimental\tfalse"));
+        assert!(lines.contains(&"mcp\tstable\tfalse"));
     }
 }

@@ -18,24 +18,13 @@ fn status_label(status: &ShellStatus, stale: bool) -> &'static str {
     }
 }
 
-fn format_elapsed(ms: u64) -> String {
-    if ms == 0 {
-        return "-".to_string();
-    }
-    if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{:.1}m", ms as f64 / 60_000.0)
-    }
-}
-
 pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
     if jobs.is_empty() {
-        return "No live background shell jobs. Jobs are process-local; after a restart, inspect durable task artifacts for prior command output.".to_string();
+        return "No live Bash jobs. Bash jobs are process-local; after a restart, inspect durable task artifacts for prior command output.".to_string();
     }
 
     let mut lines = vec![
-        format!("Background shell jobs ({})", jobs.len()),
+        format!("Bash jobs ({})", jobs.len()),
         "----------------------------------------".to_string(),
     ];
     for job in jobs {
@@ -48,7 +37,7 @@ pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
             "{}  {:8}  {}  exit={:?}{}",
             job.id,
             status_label(&job.status, job.stale),
-            format_elapsed(job.elapsed_ms),
+            crate::elapsed::format_elapsed_ms(job.elapsed_ms),
             job.exit_code,
             task
         ));
@@ -64,7 +53,7 @@ pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
         }
     }
     lines.push(
-        "Controls: /jobs show <id>, /jobs poll <id>, /jobs wait <id>, /jobs stdin <id> <input>, /jobs cancel <id>."
+        "Controls: /jobs show <id>, /jobs poll <id>, /jobs wait <id>, /jobs stdin <id> <input>, /jobs cancel <id|all>."
             .to_string(),
     );
     lines.join("\n")
@@ -73,11 +62,11 @@ pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
 pub(super) fn format_shell_poll(result: &ShellResult) -> String {
     let mut lines = vec![
         format!(
-            "Shell job {}: {} exit={:?} elapsed={}",
+            "Bash job {}: {} exit={:?} elapsed={}",
             result.task_id.as_deref().unwrap_or("(unknown)"),
             status_label(&result.status, false),
             result.exit_code,
-            format_elapsed(result.duration_ms)
+            crate::elapsed::format_elapsed_ms(result.duration_ms)
         ),
         String::new(),
     ];
@@ -104,7 +93,7 @@ pub(super) fn open_shell_job_pager(app: &mut App, detail: &ShellJobDetail) {
         .unwrap_or(100)
         .saturating_sub(4);
     app.view_stack.push(PagerView::from_text(
-        format!("Shell Job {}", detail.snapshot.id),
+        format!("Bash Job {}", detail.snapshot.id),
         &format_shell_job_detail(detail),
         width.max(60),
     ));
@@ -117,7 +106,10 @@ fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
         format!("Status: {}", status_label(&job.status, job.stale)),
         format!("Command: {}", job.command),
         format!("Cwd: {}", crate::utils::display_path(&job.cwd)),
-        format!("Elapsed: {}", format_elapsed(job.elapsed_ms)),
+        format!(
+            "Elapsed: {}",
+            crate::elapsed::format_elapsed_ms(job.elapsed_ms)
+        ),
         format!("Exit Code: {:?}", job.exit_code),
         format!("Stdin Available: {}", job.stdin_available),
     ];
@@ -125,7 +117,9 @@ fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
         lines.push(format!("Linked Task: {task_id}"));
     }
     if job.stale {
-        lines.push("Completion State: stale after restart; process is not attached.".to_string());
+        lines.push(
+            "Completion state: stale after restart; the process is no longer running.".to_string(),
+        );
     } else {
         lines.push("Completion State: live in this TUI process.".to_string());
     }
@@ -171,12 +165,22 @@ mod tests {
             stderr_len: 8,
             stdin_available: false,
             stale: true,
+            elapsed_since_output_ms: None,
             linked_task_id: Some("task_1".to_string()),
+            owner_agent_id: None,
+            owner_agent_name: None,
+            origin_tool_call_id: None,
+            origin_turn_id: None,
+            owner_session_id: "session-test".to_string(),
         }];
         let formatted = format_shell_job_list(&jobs);
+        assert!(formatted.contains("Bash jobs (1)"));
+        assert!(!formatted.contains("Background commands"));
         assert!(formatted.contains("shell_dead"));
         assert!(formatted.contains("stale"));
         assert!(formatted.contains("/jobs poll <id>"));
+        assert!(formatted.contains("/jobs cancel <id|all>"));
+        assert!(!formatted.contains("cancel-all"));
         assert!(formatted.contains("task=task_1"));
     }
 }

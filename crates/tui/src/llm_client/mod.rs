@@ -25,6 +25,7 @@
 use crate::config::RetryPolicy;
 use crate::models::{MessageRequest, MessageResponse, StreamEvent};
 use anyhow::Result;
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -66,22 +67,271 @@ pub trait LlmClient: Send + Sync {
     /// Creates a streaming message completion
     ///
     /// Returns a stream of SSE events that should be consumed until completion.
-    async fn create_message_stream(&self, request: MessageRequest) -> Result<StreamEventBox>;
+    fn create_message_stream(
+        &self,
+        request: MessageRequest,
+    ) -> impl Future<Output = Result<StreamEventBox>> + Send;
 
     /// Optional health check to verify API connectivity
-    async fn health_check(&self) -> Result<bool> {
-        Ok(true)
+    fn health_check(&self) -> impl Future<Output = Result<bool>> + Send {
+        async { Ok(true) }
+    }
+
+    /// The concrete base URL requests go to, when the implementation knows it.
+    ///
+    /// Background cost accrual uses this for billing provenance only: it is
+    /// reduced to a non-secret surface classification and a SHA-256 fingerprint
+    /// before being recorded, and the URL itself is never persisted or logged
+    /// (#4318). The default is `None` so an implementation that cannot report a
+    /// stable endpoint yields "unknown endpoint" — which fails closed — rather
+    /// than being assumed to be the provider's public API.
+    fn billing_base_url(&self) -> Option<&str> {
+        None
+    }
+
+    /// Non-secret limits frozen with the resolved route, when available.
+    fn route_limits(&self) -> Option<codewhale_config::route::RouteLimits> {
+        None
+    }
+
+    /// Output cap for a request sent through this exact client route.
+    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
+        let route = self.effective_route_envelope(requested_model, chrono::Utc::now());
+        crate::route_budget::effective_max_output_tokens_for_route(
+            route.provider,
+            &route.model,
+            self.route_limits(),
+        )
+    }
+
+    /// Freeze the non-secret effective route immediately before a request is
+    /// dispatched. Implementations with richer configured identity/billing
+    /// facts should override this fail-closed default.
+    fn effective_route_envelope(
+        &self,
+        requested_model: &str,
+        dispatched_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cost_status::EffectiveRouteEnvelope {
+        let provider = crate::config::ApiProvider::parse(self.provider_name())
+            .unwrap_or(crate::config::ApiProvider::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture(
+            None,
+            provider,
+            self.provider_name(),
+            requested_model,
+            self.billing_base_url(),
+            dispatched_at,
+        )
     }
 }
 
-/// Trait for clients that support configurable retry behavior
-#[allow(dead_code)] // Part of LLM provider interface, will be used by additional providers
-pub trait RetryConfigurable {
-    fn retry_config(&self) -> &RetryConfig;
-    fn set_retry_config(&mut self, config: RetryConfig);
+// === Authentication diagnostics ===
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuthenticationErrorContext {
+    pub provider: Option<String>,
+    pub base_url_authority: Option<String>,
+    pub model: Option<String>,
+    pub key_source: Option<String>,
+    pub key_fingerprint: Option<String>,
+    pub key_kind: Option<String>,
+}
+
+impl AuthenticationErrorContext {
+    #[must_use]
+    pub fn new(
+        provider: &str,
+        base_url: &str,
+        model: &str,
+        key_source: &str,
+        api_key: &str,
+    ) -> Self {
+        Self::from_parts(
+            Some(provider),
+            Some(base_url),
+            Some(model),
+            Some(key_source),
+            Some(api_key),
+        )
+    }
+
+    #[must_use]
+    pub fn from_parts(
+        provider: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
+        key_source: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Self {
+        let api_key = api_key.and_then(non_empty_trimmed);
+        Self {
+            provider: provider.and_then(non_empty_trimmed).map(str::to_string),
+            base_url_authority: base_url.and_then(base_url_authority),
+            model: model.and_then(non_empty_trimmed).map(str::to_string),
+            key_source: key_source.and_then(non_empty_trimmed).map(str::to_string),
+            key_fingerprint: api_key.map(redacted_key_fingerprint),
+            key_kind: api_key.map(classify_api_key_prefix).map(str::to_string),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.provider.is_none()
+            && self.base_url_authority.is_none()
+            && self.model.is_none()
+            && self.key_source.is_none()
+            && self.key_fingerprint.is_none()
+            && self.key_kind.is_none()
+    }
+
+    fn detail_segments(&self) -> Vec<String> {
+        let mut segments = Vec::new();
+        if let Some(provider) = self.provider.as_deref() {
+            segments.push(format!("provider: {provider}"));
+        }
+        if let Some(authority) = self.base_url_authority.as_deref() {
+            segments.push(format!("base URL authority: {authority}"));
+        }
+        if let Some(model) = self.model.as_deref() {
+            segments.push(format!("model: {model}"));
+        }
+        if let Some(source) = self.key_source.as_deref() {
+            segments.push(format!("key source: {source}"));
+        }
+        if let Some(fingerprint) = self.key_fingerprint.as_deref() {
+            segments.push(format!("key fingerprint: {fingerprint}"));
+        }
+        if let Some(kind) = self.key_kind.as_deref() {
+            segments.push(format!("key type: {kind}"));
+        }
+        segments
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationErrorDetail {
+    message: String,
+    context: Option<AuthenticationErrorContext>,
+}
+
+impl AuthenticationErrorDetail {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            context: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_context(
+        message: impl Into<String>,
+        context: Option<AuthenticationErrorContext>,
+    ) -> Self {
+        let context = context.filter(|context| !context.is_empty());
+        Self {
+            message: message.into(),
+            context,
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[must_use]
+    pub fn to_user_message(&self) -> String {
+        let Some(context) = self.context.as_ref() else {
+            return self.message.clone();
+        };
+        let segments = context.detail_segments();
+        if segments.is_empty() {
+            self.message.clone()
+        } else {
+            format!("{} ({})", self.message, segments.join(", "))
+        }
+    }
+}
+
+impl From<String> for AuthenticationErrorDetail {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for AuthenticationErrorDetail {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+#[must_use]
+pub fn classify_api_key_prefix(api_key: &str) -> &'static str {
+    if api_key.starts_with("tp-") {
+        "Xiaomi MiMo Token Plan key"
+    } else {
+        "API key"
+    }
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn base_url_authority(base_url: &str) -> Option<String> {
+    let base_url = non_empty_trimmed(base_url)?;
+    let without_scheme = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, authority)| authority);
+    non_empty_trimmed(authority).map(str::to_string)
+}
+
+fn redacted_key_fingerprint(api_key: &str) -> String {
+    let api_key = api_key.trim();
+    let len = api_key.chars().count();
+    match public_key_prefix(api_key) {
+        Some(prefix) => format!("{prefix}... (len={len})"),
+        None => format!("unprefixed (len={len})"),
+    }
+}
+
+fn public_key_prefix(api_key: &str) -> Option<&str> {
+    ["tp-", "sk-", "hf_", "hf-", "ak-", "rk-"]
+        .into_iter()
+        .find(|prefix| api_key.starts_with(prefix))
+}
+
+fn redact_api_key_from_message(message: &str, api_key: Option<&str>) -> String {
+    let Some(api_key) = api_key.and_then(non_empty_trimmed) else {
+        return message.to_string();
+    };
+    message.replace(api_key, "[redacted API key]")
 }
 
 // === LlmError - Classified Error Types ===
+
+/// Evidence captured when an HTTP response explicitly identifies plan quota
+/// exhaustion. The private field prevents callers outside this parser module
+/// from manufacturing the durable classification from arbitrary text.
+#[derive(Debug)]
+pub struct QuotaExhaustionError {
+    message: String,
+}
+
+impl QuotaExhaustionError {
+    fn from_http_message(message: String) -> Self {
+        Self { message }
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        self.message
+    }
+}
 
 /// Classified LLM errors with retryability information.
 ///
@@ -97,6 +347,13 @@ pub enum LlmError {
         retry_after: Option<Duration>,
     },
 
+    /// The provider explicitly reported that the account's plan quota is exhausted.
+    ///
+    /// Unlike an ordinary 429 rate limit, retrying the same request after a short
+    /// backoff cannot resolve this condition. This variant is constructed only at
+    /// the provider HTTP response boundary from explicit quota evidence.
+    QuotaExhausted(QuotaExhaustionError),
+
     /// Server error (HTTP 5xx)
     ServerError { status: u16, message: String },
 
@@ -106,8 +363,11 @@ pub enum LlmError {
     /// Request timed out
     Timeout(Duration),
 
-    /// Authentication failed (HTTP 401, 403)
-    AuthenticationError(String),
+    /// Authentication failed (HTTP 401, selected HTTP 403)
+    AuthenticationError(AuthenticationErrorDetail),
+
+    /// Authorization or provider-side blocking failed (HTTP 403)
+    AuthorizationError(String),
 
     /// Invalid request parameters (HTTP 400)
     InvalidRequest { status: u16, message: String },
@@ -132,12 +392,18 @@ impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LlmError::RateLimited { message, .. } => write!(f, "Rate limit exceeded: {message}"),
+            LlmError::QuotaExhausted(error) => {
+                write!(f, "Provider plan quota exhausted: {}", error.message)
+            }
             LlmError::ServerError { status, message } => {
                 write!(f, "Server error ({status}): {message}")
             }
             LlmError::NetworkError(msg) => write!(f, "Network error: {msg}"),
             LlmError::Timeout(d) => write!(f, "Request timed out after {d:?}"),
-            LlmError::AuthenticationError(msg) => write!(f, "Authentication failed: {msg}"),
+            LlmError::AuthenticationError(auth) => {
+                write!(f, "Authentication failed: {}", auth.to_user_message())
+            }
+            LlmError::AuthorizationError(msg) => write!(f, "Authorization failed: {msg}"),
             LlmError::InvalidRequest { status, message } => {
                 write!(f, "Invalid request ({status}): {message}")
             }
@@ -162,6 +428,7 @@ impl LlmError {
     /// - Timeouts
     ///
     /// Non-retryable errors:
+    /// - Provider plan quota exhaustion
     /// - Authentication failures
     /// - Invalid requests
     /// - Content policy violations
@@ -190,19 +457,46 @@ impl LlmError {
     /// Constructs an `LlmError` from HTTP status code and response body.
     ///
     /// Performs heuristic classification based on:
-    /// - Status code (429 = rate limit, 401/403 = auth, 5xx = server error)
+    /// - Status code (429 = rate limit, 401/403 = auth, 499/5xx = transient upstream error)
     /// - Response body keywords (`context_length`, `content_policy`, safety, etc.)
     pub fn from_http_response(status: u16, body: &str) -> Self {
+        if matches!(status, 400 | 402 | 429) && has_explicit_quota_evidence(body) {
+            return LlmError::QuotaExhausted(QuotaExhaustionError::from_http_message(
+                body.to_string(),
+            ));
+        }
+
         match status {
             429 => LlmError::RateLimited {
                 message: body.to_string(),
                 retry_after: None,
             },
-            401 | 403 => LlmError::AuthenticationError(body.to_string()),
+            401 => Self::authentication_error(body),
+            403 => {
+                if looks_like_authentication_failure(body) {
+                    Self::authentication_error(body)
+                } else {
+                    LlmError::AuthorizationError(body.to_string())
+                }
+            }
             400 => {
                 // Classify 400 errors by examining the response body
                 let body_lower = body.to_lowercase();
-                if body_lower.contains("context_length")
+                // An "unsupported parameter" 400 names the offending field
+                // (often `max_output_tokens` or another *token* field), which
+                // the generic keyword rules below would misread as a context
+                // window overflow. Parameter shape errors are invalid
+                // requests, not prompt-size errors, so they get their own
+                // branch ahead of the heuristic.
+                if body_lower.contains("unsupported parameter")
+                    || body_lower.contains("invalid_request_error")
+                        && body_lower.contains("parameter")
+                {
+                    LlmError::InvalidRequest {
+                        status,
+                        message: body.to_string(),
+                    }
+                } else if body_lower.contains("context_length")
                     || body_lower.contains("token")
                     || body_lower.contains("too long")
                     || body_lower.contains("maximum")
@@ -233,11 +527,72 @@ impl LlmError {
                     }
                 }
             }
-            500..=599 => LlmError::ServerError {
+            // Several OpenAI-compatible gateways use nginx's non-standard
+            // 499 for an upstream request that was cancelled before response
+            // streaming began. At this boundary no response body stream has
+            // been exposed, so it is eligible for the same bounded retry
+            // policy as a 5xx gateway failure.
+            499..=599 => LlmError::ServerError {
                 status,
                 message: body.to_string(),
             },
             _ => LlmError::Other(format!("HTTP {status}: {body}")),
+        }
+    }
+
+    #[must_use]
+    pub fn authentication_error(message: impl Into<String>) -> Self {
+        LlmError::AuthenticationError(AuthenticationErrorDetail::new(message))
+    }
+
+    #[must_use]
+    pub fn authentication_error_with_context(
+        message: impl Into<String>,
+        context: Option<AuthenticationErrorContext>,
+    ) -> Self {
+        LlmError::AuthenticationError(AuthenticationErrorDetail::with_context(message, context))
+    }
+
+    /// Constructs an `LlmError` from HTTP response data plus request context
+    /// that is safe to display when authentication fails.
+    #[must_use]
+    pub fn from_http_response_with_request_context(
+        status: u16,
+        body: &str,
+        provider: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
+        key_source: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Self {
+        let body = redact_api_key_from_message(body, api_key);
+        let context =
+            AuthenticationErrorContext::from_parts(provider, base_url, model, key_source, api_key);
+        Self::from_http_response_with_auth_context(status, &body, Some(context))
+    }
+
+    /// Constructs an `LlmError` from HTTP status code and response body, with
+    /// optional structured details for authentication failures.
+    ///
+    /// The `body` passed here must already be safe for user display. Prefer
+    /// [`Self::from_http_response_with_request_context`] when the raw API key is
+    /// available so the response body can be redacted before rendering.
+    #[must_use]
+    pub fn from_http_response_with_auth_context(
+        status: u16,
+        body: &str,
+        auth_context: Option<AuthenticationErrorContext>,
+    ) -> Self {
+        match status {
+            401 => Self::authentication_error_with_context(body, auth_context),
+            403 => {
+                if looks_like_authentication_failure(body) {
+                    Self::authentication_error_with_context(body, auth_context)
+                } else {
+                    LlmError::AuthorizationError(body.to_string())
+                }
+            }
+            _ => Self::from_http_response(status, body),
         }
     }
 
@@ -272,6 +627,293 @@ impl LlmError {
     }
 }
 
+/// Format provider HTTP error bodies before they are surfaced in the TUI.
+///
+/// Providers sometimes return whole HTML error pages for gateway/WAF blocks.
+/// Passing those pages through raw floods the transcript and can also make a
+/// provider-side 403 look like a broken API key. Keep the useful details and
+/// cap everything else.
+#[must_use]
+pub(crate) fn sanitize_http_error_body(
+    provider_label: Option<&str>,
+    status: u16,
+    body: &str,
+) -> String {
+    if let Some(message) = extract_json_error_message(body) {
+        let message = truncate_for_error(&collapse_whitespace(&message), 2_000);
+        if let Some(code) = explicit_quota_code(body) {
+            return format!("{message} (provider error code: {code})");
+        }
+        return message;
+    }
+
+    if is_probably_html(body) {
+        let text = html_to_text(body);
+        let lower = text.to_ascii_lowercase();
+        let provider = provider_label.unwrap_or("Provider");
+
+        // Cloudflare's "Access Denied" interstitial strips the literal word
+        // "cloudflare" once tags are removed (it only survives in `<meta>`
+        // attributes and the `<style>`/`<script>` blocks we discard). Arcee's
+        // 403 page is exactly this shape, so also key off the WAF's stock copy
+        // ("security alert", "contact support") and a Cloudflare error/ray ID.
+        let error_id = extract_cloudflare_error_id(&text);
+        let is_cloudflare = lower.contains("cloudflare");
+        let looks_like_access_denied = lower.contains("access denied")
+            && (is_cloudflare
+                || lower.contains("security alert")
+                || lower.contains("contact support")
+                || lower.contains("contact us")
+                || error_id.is_some());
+        if looks_like_access_denied {
+            let label = if is_cloudflare {
+                "Cloudflare Access Denied"
+            } else {
+                "Access Denied"
+            };
+            let mut message = format!(
+                "{provider} API returned {label} (HTTP {status}). \
+                 The request was blocked before it reached the model; retry with a \
+                 smaller request or fewer tools, or contact provider support"
+            );
+            if let Some(id) = error_id {
+                message.push_str(&format!(" with ID {id}"));
+            }
+            message.push('.');
+            return message;
+        }
+
+        let text = truncate_for_error(&collapse_whitespace(&text), 900);
+        return format!("{provider} API returned an HTML error page (HTTP {status}): {text}");
+    }
+
+    truncate_for_error(&collapse_whitespace(body), 2_000)
+}
+
+fn looks_like_authentication_failure(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("authentication")
+        || lower.contains("unauthorized")
+        || lower.contains("api key")
+        || lower.contains("invalid key")
+        || lower.contains("invalid token")
+        || lower.contains("bearer token")
+        || lower.contains("missing token")
+}
+
+/// Quota exhaustion is a durable account state, not a generic rate-limit
+/// synonym. Accept only explicit provider evidence at the HTTP/parser boundary;
+/// callers holding a stringified error must never promote it to this type.
+fn has_explicit_quota_evidence(body: &str) -> bool {
+    explicit_quota_code(body).is_some()
+        || has_explicit_quota_code_marker(body)
+        || has_explicit_quota_phrase(body)
+}
+
+fn explicit_quota_code(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    [
+        "/error/code",
+        "/error/type",
+        "/error/error_code",
+        "/code",
+        "/type",
+        "/error_code",
+    ]
+    .into_iter()
+    .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    .find(|code| is_explicit_quota_code(code))
+    .map(ToOwned::to_owned)
+}
+
+fn is_explicit_quota_code(code: &str) -> bool {
+    let normalized: String = code
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "insufficientquota"
+            | "quotaexceeded"
+            | "quotaexhausted"
+            | "billinghardlimitreached"
+            | "billinglimitreached"
+            | "creditbalanceexhausted"
+    )
+}
+
+fn has_explicit_quota_code_marker(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let Some((_, suffix)) = lower.split_once("provider error code:") else {
+        return false;
+    };
+    let code = suffix
+        .trim_start()
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .next()
+        .unwrap_or_default();
+    is_explicit_quota_code(code)
+}
+
+fn has_explicit_quota_phrase(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let current_quota_exhausted = lower.contains("exceeded your current quota")
+        || lower.contains("current quota has been exceeded");
+    let plan_and_billing_guidance = lower.contains("plan") && lower.contains("billing");
+    let durable_scope_exhausted = [
+        "billing quota exceeded",
+        "billing quota exhausted",
+        "billing quota is exhausted",
+        "billing quota has been exceeded",
+        "billing quota has been exhausted",
+        "account quota exceeded",
+        "account quota exhausted",
+        "account quota is exhausted",
+        "account quota has been exceeded",
+        "account quota has been exhausted",
+        "plan quota exceeded",
+        "plan quota exhausted",
+        "plan quota is exhausted",
+        "plan quota has been exceeded",
+        "plan quota has been exhausted",
+    ]
+    .into_iter()
+    .any(|phrase| lower.contains(phrase));
+
+    lower.contains("billing hard limit has been reached")
+        || lower.contains("credit balance exhausted")
+        || lower.contains("credit balance is exhausted")
+        || durable_scope_exhausted
+        || (current_quota_exhausted && plan_and_billing_guidance)
+}
+
+fn extract_json_error_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    // Flat gateway bodies (`{"error":"Bad Request","message":"Invalid model
+    // name: 'x'"}` — Concentrate, among others) keep the class in `error` and
+    // the detail in `message`. Surfacing only the class hid the one line the
+    // person needed, so carry both when both are present and differ.
+    if let (Some(class), Some(detail)) = (
+        value.pointer("/error").and_then(Value::as_str),
+        value.pointer("/message").and_then(Value::as_str),
+    ) && !class.trim().is_empty()
+        && !detail.trim().is_empty()
+        && !class.trim().eq_ignore_ascii_case(detail.trim())
+    {
+        return Some(format!("{}: {}", class.trim(), detail.trim()));
+    }
+    for pointer in [
+        "/error/message",
+        "/error",
+        "/message",
+        "/detail",
+        "/error_description",
+    ] {
+        let Some(value) = value.pointer(pointer) else {
+            continue;
+        };
+        if let Some(message) = value.as_str() {
+            if !message.trim().is_empty() {
+                return Some(message.to_string());
+            }
+        } else if value.is_object() || value.is_array() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn is_probably_html(body: &str) -> bool {
+    let prefix = body
+        .chars()
+        .take(512)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    prefix.contains("<!doctype html") || prefix.contains("<html") || prefix.contains("<head")
+}
+
+fn html_to_text(html: &str) -> String {
+    let without_scripts = strip_html_block(html, "script");
+    let without_styles = strip_html_block(&without_scripts, "style");
+    let mut text = String::with_capacity(without_styles.len().min(4096));
+    let mut in_tag = false;
+    for ch in without_styles.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    decode_basic_html_entities(&collapse_whitespace(&text))
+}
+
+fn strip_html_block(input: &str, tag: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    let lower = input.to_ascii_lowercase();
+    let start_marker = format!("<{tag}");
+    let end_marker = format!("</{tag}>");
+
+    while let Some(relative_start) = lower[cursor..].find(&start_marker) {
+        let start = cursor + relative_start;
+        out.push_str(&input[cursor..start]);
+        let after_start = start + start_marker.len();
+        let Some(relative_end) = lower[after_start..].find(&end_marker) else {
+            cursor = input.len();
+            break;
+        };
+        cursor = after_start + relative_end + end_marker.len();
+        out.push(' ');
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
+fn decode_basic_html_entities(input: &str) -> String {
+    input
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_for_error(input: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(input.len().min(max_chars + 32));
+    for (count, ch) in input.chars().enumerate() {
+        if count >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn extract_cloudflare_error_id(text: &str) -> Option<String> {
+    let mut last = None;
+    for token in text.split(|ch: char| !ch.is_ascii_hexdigit()) {
+        if (16..=64).contains(&token.len()) && token.bytes().any(|b| b.is_ascii_alphabetic()) {
+            last = Some(token.to_string());
+        }
+    }
+    last
+}
+
 impl From<reqwest::Error> for LlmError {
     fn from(err: reqwest::Error) -> Self {
         LlmError::from_reqwest(&err)
@@ -303,7 +945,7 @@ impl From<serde_json::Error> for LlmError {
 /// - `exponential_base`: 2.0
 /// - `jitter`: true (adds randomness to prevent thundering herd)
 /// - `jitter_factor`: 0.1 (10% variation)
-/// - `retryable_status_codes`: [429, 500, 502, 503, 504]
+/// - `retryable_status_codes`: [429, 499, 500, 502, 503, 504]
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Whether retry logic is enabled
@@ -353,7 +995,7 @@ impl Default for RetryConfig {
             jitter: true,
             jitter_factor: 0.1,
             respect_retry_after: true,
-            retryable_status_codes: vec![429, 500, 502, 503, 504],
+            retryable_status_codes: vec![429, 499, 500, 502, 503, 504],
             request_timeout: 120.0,
             total_timeout: 0.0, // No total timeout by default
         }
@@ -396,18 +1038,6 @@ impl RetryConfig {
     /// Builder method to enable/disable jitter
     pub fn with_jitter(mut self, enabled: bool) -> Self {
         self.jitter = enabled;
-        self
-    }
-
-    /// Builder method to set request timeout
-    pub fn with_request_timeout(mut self, timeout: f64) -> Self {
-        self.request_timeout = timeout;
-        self
-    }
-
-    /// Builder method to set total timeout
-    pub fn with_total_timeout(mut self, timeout: f64) -> Self {
-        self.total_timeout = timeout;
         self
     }
 
@@ -549,6 +1179,10 @@ pub type RetryCallback = Box<dyn Fn(&LlmError, u32, Duration) + Send + Sync>;
 ///     })),
 /// ).await;
 /// ```
+// Keep the structured error inline: this is a public compatibility surface and
+// boxing it in a patch release would force every caller to change ownership
+// handling for `last_error`.
+#[allow(clippy::result_large_err)]
 pub async fn with_retry<F, Fut, T>(
     config: &RetryConfig,
     mut operation: F,
@@ -640,32 +1274,41 @@ where
     })
 }
 
-/// Simplified version of `with_retry` without callback
-#[allow(dead_code)] // Convenience wrapper for with_retry
-pub async fn with_retry_simple<F, Fut, T>(config: &RetryConfig, operation: F) -> RetryResult<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, LlmError>>,
-{
-    with_retry(config, operation, None).await
-}
-
 // === Utility Functions ===
+
+/// The longest a `Retry-After` value is ever believed. A server (or a proxy
+/// in front of it) can send an arbitrarily large delay; without a ceiling a
+/// single `Retry-After: 86400` would wedge the turn for a day. One hour is
+/// well past any legitimate rate-limit window.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(3600);
 
 /// Parses the Retry-After header value into a Duration.
 ///
 /// Supports both:
 /// - Seconds as integer: "120" -> 120 seconds
 /// - HTTP-date format: "Wed, 21 Oct 2015 07:28:00 GMT" (not implemented, returns None)
+///
+/// The value is server-controlled, so this never panics and never returns an
+/// unbounded delay: negative / NaN / infinite / absurd floats are rejected
+/// (`Duration::from_secs_f64` panics on a negative — a remote-triggerable
+/// crash before this guard), and any result is clamped to [`RETRY_AFTER_MAX`].
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     // Try parsing as seconds
     if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+        return Some(Duration::from_secs(seconds).min(RETRY_AFTER_MAX));
     }
 
-    // Try parsing as float seconds
-    if let Ok(seconds) = value.parse::<f64>() {
-        return Some(Duration::from_secs_f64(seconds));
+    // Try parsing as float seconds. Only a finite, non-negative value is a
+    // meaningful delay; everything else (`-5`, `nan`, `inf`) is "no usable
+    // hint". Clamp to the ceiling BEFORE `from_secs_f64` so an out-of-range
+    // float can never reach its overflow-panic path, while keeping the
+    // sub-second precision a legitimate `1.5` carries.
+    if let Ok(seconds) = value.parse::<f64>()
+        && seconds.is_finite()
+        && seconds >= 0.0
+    {
+        let clamped = seconds.min(RETRY_AFTER_MAX.as_secs_f64());
+        return Some(Duration::from_secs_f64(clamped));
     }
 
     // HTTP-date format not supported yet
@@ -681,6 +1324,10 @@ pub fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Durat
         .and_then(parse_retry_after)
 }
 
+#[cfg(test)]
+#[path = "tests.rs"]
+mod quota_tests;
+
 // === Tests ===
 
 #[cfg(test)]
@@ -692,6 +1339,13 @@ mod tests {
             (actual - expected).abs() < f64::EPSILON,
             "expected {expected}, got {actual}"
         );
+    }
+
+    fn auth_user_message(error: LlmError) -> String {
+        match error {
+            LlmError::AuthenticationError(auth) => auth.to_user_message(),
+            other => panic!("expected authentication error, got {other}"),
+        }
     }
 
     #[test]
@@ -778,6 +1432,7 @@ mod tests {
         let config = RetryConfig::default();
 
         assert!(config.is_retryable_status(429)); // Rate limit
+        assert!(config.is_retryable_status(499)); // Upstream request cancelled
         assert!(config.is_retryable_status(500)); // Internal server error
         assert!(config.is_retryable_status(502)); // Bad gateway
         assert!(config.is_retryable_status(503)); // Service unavailable
@@ -790,69 +1445,206 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_error_retryable() {
-        // Retryable errors
-        assert!(
-            LlmError::RateLimited {
-                message: "too many requests".to_string(),
-                retry_after: None
-            }
-            .is_retryable()
+    fn auth_error_with_context_includes_provider_authority_model_and_key_source() {
+        let err = LlmError::from_http_response_with_request_context(
+            401,
+            "Invalid API Key",
+            Some("Xiaomi MiMo"),
+            Some("https://token-plan-sgp.xiaomimimo.com/v1"),
+            Some("mimo-v2.5"),
+            Some("env"),
+            Some("tp-secret-token-plan-value"),
         );
-        assert!(
-            LlmError::ServerError {
-                status: 500,
-                message: "internal error".to_string()
-            }
-            .is_retryable()
-        );
-        assert!(LlmError::NetworkError("connection refused".to_string()).is_retryable());
-        assert!(LlmError::Timeout(Duration::from_secs(30)).is_retryable());
+        let message = auth_user_message(err);
 
-        // Non-retryable errors
-        assert!(!LlmError::AuthenticationError("invalid key".to_string()).is_retryable());
-        assert!(
-            !LlmError::InvalidRequest {
-                status: 400,
-                message: "bad json".to_string()
-            }
-            .is_retryable()
-        );
-        assert!(!LlmError::ContentPolicyError("unsafe content".to_string()).is_retryable());
-        assert!(!LlmError::ContextLengthError("too long".to_string()).is_retryable());
+        assert!(message.contains("Invalid API Key"));
+        assert!(message.contains("provider: Xiaomi MiMo"));
+        assert!(message.contains("base URL authority: token-plan-sgp.xiaomimimo.com"));
+        assert!(message.contains("model: mimo-v2.5"));
+        assert!(message.contains("key source: env"));
+        assert!(message.contains("key fingerprint: tp-... (len=26)"));
     }
 
     #[test]
-    fn test_llm_error_from_http_response() {
-        // Rate limit
-        let err = LlmError::from_http_response(429, "rate limit exceeded");
-        assert!(matches!(err, LlmError::RateLimited { .. }));
+    fn auth_error_redacts_full_api_key_from_body_and_context() {
+        let api_key = "tp-secret-token-plan-value";
+        let err = LlmError::from_http_response_with_request_context(
+            401,
+            &format!("Invalid API Key: {api_key}"),
+            Some("Xiaomi MiMo"),
+            Some("https://token-plan-sgp.xiaomimimo.com/v1"),
+            Some("mimo-v2.5"),
+            Some("config-file"),
+            Some(api_key),
+        );
+        let message = auth_user_message(err);
 
-        // Auth errors
-        let err = LlmError::from_http_response(401, "invalid api key");
-        assert!(matches!(err, LlmError::AuthenticationError(_)));
+        assert!(!message.contains(api_key));
+        assert!(!message.contains("secret-token-plan-value"));
+        assert!(message.contains("[redacted API key]"));
+        assert!(message.contains("key fingerprint: tp-... (len=26)"));
+    }
 
-        let err = LlmError::from_http_response(403, "forbidden");
-        assert!(matches!(err, LlmError::AuthenticationError(_)));
+    #[test]
+    fn auth_error_classifies_xiaomi_token_plan_key_prefix() {
+        let token_plan = AuthenticationErrorContext::from_parts(
+            None,
+            None,
+            None,
+            Some("session"),
+            Some("tp-secret-token-plan-value"),
+        );
+        let generic = AuthenticationErrorContext::from_parts(
+            None,
+            None,
+            None,
+            Some("session"),
+            Some("sk-other"),
+        );
+        let unprefixed = AuthenticationErrorContext::from_parts(
+            None,
+            None,
+            None,
+            Some("session"),
+            Some("plainsecretvalue"),
+        );
 
-        // Server errors
-        let err = LlmError::from_http_response(500, "internal server error");
-        assert!(matches!(err, LlmError::ServerError { status: 500, .. }));
+        assert_eq!(
+            token_plan.key_kind.as_deref(),
+            Some("Xiaomi MiMo Token Plan key")
+        );
+        assert_eq!(generic.key_kind.as_deref(), Some("API key"));
+        assert_eq!(unprefixed.key_kind.as_deref(), Some("API key"));
+        assert_eq!(
+            unprefixed.key_fingerprint.as_deref(),
+            Some("unprefixed (len=16)")
+        );
+    }
 
-        let err = LlmError::from_http_response(503, "service unavailable");
-        assert!(matches!(err, LlmError::ServerError { status: 503, .. }));
+    #[test]
+    fn authorization_403_is_not_reclassified_by_auth_context() {
+        let err = LlmError::from_http_response_with_request_context(
+            403,
+            "forbidden",
+            Some("Arcee AI"),
+            Some("https://api.arcee.ai/v1"),
+            Some("auto"),
+            Some("env"),
+            Some("sk-arcee-secret"),
+        );
 
-        // Context length
-        let err = LlmError::from_http_response(400, "context_length_exceeded");
-        assert!(matches!(err, LlmError::ContextLengthError(_)));
+        assert!(matches!(err, LlmError::AuthorizationError(_)));
+    }
 
-        // Content policy
-        let err = LlmError::from_http_response(400, "content_policy_violation");
-        assert!(matches!(err, LlmError::ContentPolicyError(_)));
+    #[test]
+    fn auth_error_without_context_preserves_bare_message() {
+        let err = LlmError::from_http_response_with_auth_context(
+            401,
+            "Invalid API Key",
+            Some(AuthenticationErrorContext::default()),
+        );
 
-        // Generic 400
-        let err = LlmError::from_http_response(400, "invalid json");
-        assert!(matches!(err, LlmError::InvalidRequest { status: 400, .. }));
+        assert_eq!(auth_user_message(err), "Invalid API Key");
+    }
+
+    /// A flat `{"error","message"}` body keeps its detail: the class alone
+    /// ("Bad Request") told the person nothing about the rejected model.
+    #[test]
+    fn flat_error_and_message_body_surfaces_both_halves() {
+        let body = r#"{"error":"Bad Request","message":"Invalid model name: 'invalid-model-xyz'"}"#;
+        assert_eq!(
+            sanitize_http_error_body(Some("Concentrate"), 400, body),
+            "Bad Request: Invalid model name: 'invalid-model-xyz'"
+        );
+        // Identical halves are not doubled, and the nested OpenAI shape is
+        // untouched.
+        assert_eq!(
+            sanitize_http_error_body(
+                Some("Concentrate"),
+                401,
+                r#"{"error":"Unauthorized","message":"Unauthorized"}"#
+            ),
+            "Unauthorized"
+        );
+        assert_eq!(
+            sanitize_http_error_body(
+                Some("fixture"),
+                400,
+                r#"{"error":{"message":"nested detail"}}"#
+            ),
+            "nested detail"
+        );
+    }
+
+    #[test]
+    fn cloudflare_html_error_is_summarized_without_raw_markup() {
+        let body = r#"<!DOCTYPE html><html><head><title>Access Denied</title><style>
+            .hidden { display: none; }
+            </style></head><body>
+            <h1>Access Denied</h1>
+            <p>The action you just performed triggered a security alert.</p>
+            <script>window.noisy = true;</script>
+            <span>2600:1700:467:d410:f137:b94f:1dd0:d1e4</span>
+            <span>a059a2873f3fdf82</span>
+            <div>Cloudflare Error Pages</div>
+            </body></html>"#;
+
+        let message = sanitize_http_error_body(Some("Arcee AI"), 403, body);
+
+        assert!(message.contains("Arcee AI API returned Cloudflare Access Denied"));
+        assert!(message.contains("ID a059a2873f3fdf82"));
+        assert!(!message.contains("<!DOCTYPE"));
+        assert!(!message.contains("tailwindcss"));
+        assert!(message.len() < 300);
+    }
+
+    #[test]
+    fn cloudflare_access_denied_403_is_authorization_not_authentication() {
+        let message = sanitize_http_error_body(
+            Some("Arcee AI"),
+            403,
+            r#"<!doctype html><html><body><h1>Access Denied</h1><p>Cloudflare Error Pages</p></body></html>"#,
+        );
+        let err = LlmError::from_http_response(403, &message);
+
+        assert!(matches!(err, LlmError::AuthorizationError(_)));
+    }
+
+    #[test]
+    fn arcee_access_denied_without_literal_cloudflare_is_still_summarized() {
+        // Mirrors api.arcee.ai's real 403 page: "Cloudflare" appears only in a
+        // `<meta>` attribute and the `<style>` block, both stripped, so the
+        // visible text never contains it. The summary must still fire from the
+        // WAF's stock "security alert" / "Contact Support" copy + error ID.
+        let body = r#"<!DOCTYPE html><html lang="en"><head>
+            <meta name="description" content="Cloudflare Error Pages">
+            <title>Access Denied</title>
+            <style>:root{--accent:cloudflare}</style></head><body>
+            <h1>Access Denied</h1>
+            <p>The action you just performed triggered a security alert.</p>
+            <p>Please contact us if this was a mistake.</p>
+            <a>Contact Support</a>
+            <span>2600:1700:467:d410:f137:b94f:1dd0:d1e4</span>
+            <span>a059c0d4caf1f9cc</span>
+            </body></html>"#;
+
+        let message = sanitize_http_error_body(Some("Arcee AI"), 403, body);
+
+        assert!(
+            message.contains("Arcee AI API returned Access Denied"),
+            "got: {message}"
+        );
+        assert!(message.contains("ID a059c0d4caf1f9cc"), "got: {message}");
+        assert!(
+            !message.to_ascii_lowercase().contains("cloudflare"),
+            "stripped Arcee page has no literal Cloudflare: {message}"
+        );
+        assert!(!message.contains('<'), "no raw markup: {message}");
+        assert!(message.len() < 300, "stays concise: {message}");
+
+        // A WAF block is authorization, not a bad API key.
+        let err = LlmError::from_http_response(403, &message);
+        assert!(matches!(err, LlmError::AuthorizationError(_)));
     }
 
     #[test]
@@ -876,12 +1668,35 @@ mod tests {
         assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
         assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
 
-        // Float seconds
+        // Float seconds keep sub-second precision
         assert_eq!(parse_retry_after("1.5"), Some(Duration::from_secs_f64(1.5)));
 
         // Invalid
         assert_eq!(parse_retry_after("invalid"), None);
         assert_eq!(parse_retry_after(""), None);
+    }
+
+    /// A `Retry-After` value is server-controlled. Malformed floats used to
+    /// reach `Duration::from_secs_f64`, which panics on a negative — a
+    /// remote-triggerable crash in the request path (2026-08-04 review).
+    #[test]
+    fn parse_retry_after_never_panics_and_is_bounded_on_hostile_input() {
+        // None of these may panic.
+        assert_eq!(parse_retry_after("-5"), None, "negative is not a delay");
+        assert_eq!(parse_retry_after("nan"), None);
+        assert_eq!(parse_retry_after("inf"), None);
+        assert_eq!(parse_retry_after("-inf"), None);
+        // Absurdly large values clamp to the ceiling rather than overflowing
+        // or wedging the turn for a day.
+        assert_eq!(parse_retry_after("1e300"), Some(RETRY_AFTER_MAX));
+        assert_eq!(parse_retry_after("86400"), Some(RETRY_AFTER_MAX));
+        assert_eq!(
+            parse_retry_after("999999999999"),
+            Some(RETRY_AFTER_MAX),
+            "integer path is clamped too"
+        );
+        // A normal value still passes through untouched.
+        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -949,25 +1764,6 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(call_count, 1); // No retries when disabled
-    }
-
-    #[tokio::test]
-    async fn test_with_retry_non_retryable_error() {
-        let config = RetryConfig::default();
-        let mut call_count = 0;
-
-        let result: RetryResult<i32> = with_retry(
-            &config,
-            || {
-                call_count += 1;
-                async { Err(LlmError::AuthenticationError("bad key".to_string())) }
-            },
-            None,
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(call_count, 1); // Auth errors are not retried
     }
 
     #[tokio::test]

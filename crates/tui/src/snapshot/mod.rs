@@ -32,6 +32,13 @@
 //! the disk is full, or the workspace is on a read-only filesystem, the
 //! turn proceeds and the engine logs a warning. The snapshot is a
 //! safety net, not a correctness gate.
+//!
+//! Workspaces over the configured size cap (`[snapshots] max_workspace_gb`,
+//! default 2 GB of non-excluded content) skip snapshot init entirely. That
+//! disable is intentionally loud: the operator is told once that undo is off
+//! for the workspace, with the opt-in knobs (raise the cap, or set
+//! `max_workspace_gb = 0` to disable the size gate). Scoped snapshot roots are
+//! not yet a first-class config; the practical opt-in today is the cap override.
 
 pub mod paths;
 pub mod prune;
@@ -40,5 +47,12 @@ pub mod repo;
 #[allow(unused_imports)]
 pub use paths::{snapshot_dir_for, snapshot_git_dir};
 pub use prune::{DEFAULT_MAX_AGE, prune_older_than};
+
+/// Maximum snapshots kept per workspace side-repo. Oldest are pruned
+/// after each new snapshot to cap disk usage (#1112).
+pub const DEFAULT_MAX_SNAPSHOTS: usize = 50;
 #[allow(unused_imports)]
-pub use repo::{Snapshot, SnapshotId, SnapshotRepo};
+pub use repo::{
+    DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT, Snapshot, SnapshotId, SnapshotRepo,
+    estimate_workspace_size_bounded,
+};

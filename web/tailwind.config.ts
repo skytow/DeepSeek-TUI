@@ -5,28 +5,34 @@ export default {
   theme: {
     extend: {
       colors: {
-        // DeepSeek-aligned palette: cool white + soft gray, indigo accents.
-        // (Previous warm cream `#F4F1E8` read too "Anthropic-like".)
-        paper: "#FFFFFF",
-        "paper-deep": "#F4F6FB",
-        "paper-edge": "#E5E8F0",
-        "paper-line": "#0E0E10",
-        "paper-line-soft": "#D4D8E2",
-        ink: "#0E0E10",
-        "ink-soft": "#2E2E33",
-        "ink-mute": "#6B7280",
-        indigo: "#4D6BFE",
-        "indigo-deep": "#3A52CC",
-        "indigo-pale": "#E9EEFE",
-        ochre: "#9C7A3F",
-        jade: "#0AB68B",
-        cobalt: "#1F3A8A",
+        // The surface, ink, and accent tokens all resolve through CSS custom
+        // properties so the docs light sheet can re-theme the subtree, while
+        // the default values stay the Tideline dark whale palette.
+        paper: "rgb(var(--c-paper) / <alpha-value>)",
+        "paper-deep": "rgb(var(--c-paper-deep) / <alpha-value>)",
+        "paper-edge": "rgb(var(--c-paper-edge) / <alpha-value>)",
+        "paper-card": "var(--paper-card)",
+        "paper-line": "var(--paper-line)",
+        "paper-line-soft": "var(--paper-line-soft)",
+        ink: "rgb(var(--c-ink) / <alpha-value>)",
+        "ink-soft": "rgb(var(--c-ink-soft) / <alpha-value>)",
+        "ink-mute": "rgb(var(--c-ink-mute) / <alpha-value>)",
+        indigo: "rgb(var(--c-indigo) / <alpha-value>)",
+        "indigo-deep": "rgb(var(--c-indigo-deep) / <alpha-value>)",
+        "indigo-pale": "var(--indigo-pale)",
+        ochre: "var(--ochre)",
+        jade: "var(--jade)",
+        cobalt: "var(--cobalt)",
       },
       fontFamily: {
-        display: ['"Fraunces"', '"Noto Serif SC"', "ui-serif", "Georgia", "serif"],
-        body: ['"IBM Plex Sans"', '"Noto Sans SC"', "ui-sans-serif", "system-ui", "sans-serif"],
-        cjk: ['"Noto Serif SC"', '"Source Han Serif SC"', "serif"],
-        mono: ['"JetBrains Mono"', "ui-monospace", "Menlo", "monospace"],
+        // Display and body are one instrument voice — system sans at heading
+        // weight and tracking (globals.css resolves --font-display to
+        // --font-body). Mono stays JetBrains Mono, loaded by next/font in
+        // app/[locale]/layout.tsx.
+        display: ["var(--font-display)", "ui-sans-serif", "system-ui", "sans-serif"],
+        body: ["var(--font-body)", '"IBM Plex Sans"', '"Noto Sans SC"', "ui-sans-serif", "system-ui", "sans-serif"],
+        cjk: ["var(--font-cjk)", '"PingFang SC"', '"Source Han Serif SC"', "serif"],
+        mono: ["var(--font-mono)", '"JetBrains Mono"', "ui-monospace", "Menlo", "monospace"],
       },
       letterSpacing: {
         crisp: "-0.018em",

@@ -1,11 +1,15 @@
 [package]
-name = "deepseek-agent"
+name = "codewhale-agent"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Model/provider registry and fallback strategy for DeepSeek workspace architecture"
+description = "Model/provider registry and fallback strategy for Codewhale"
+
+[lints]
+workspace = true
 
 [dependencies]
-deepseek-config = { path = "../config", version = "0.8.18" }
+codewhale-config = { path = "../config", version = "0.9.12" }
 serde.workspace = true

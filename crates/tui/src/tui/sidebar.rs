@@ -1,972 +1,754 @@
-//! Sidebar rendering — Plan / Todos / Tasks / Agents panels.
+//! Sub-agent row projection shared by the agent details view and the
+//! roster: display name, typed status word, and child progress per worker.
 //!
-//! Extracted from `tui/ui.rs` (P1.2). The sidebar appears to the right of
-//! the chat transcript when the available width allows it. Each section
-//! reads from `App` snapshots; mutation lives in the main app loop.
+//! This is what is left of the classic sidebar (Pinned / Activity / Agents /
+//! Context line panels). Those panels were retired when every dock view moved
+//! onto the work surface's row pipeline (2026-09-02); the projection below is
+//! the part other surfaces still read.
 
-use std::fmt::Write;
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus, localized_whale_display_names};
 
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    prelude::Widget,
-    style::{Style, Stylize},
-    text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
-};
+use super::app::{AgentCurrentActivityStatus, App};
 
-use crate::deepseek_theme::Theme;
-use crate::palette;
-use crate::tools::plan::StepStatus;
-use crate::tools::subagent::SubAgentStatus;
-use crate::tools::todo::TodoStatus;
-
-use super::app::{App, SidebarFocus};
-use super::history::{HistoryCell, ToolCell, ToolStatus};
-use super::subagent_routing::active_fanout_counts;
-use super::ui::truncate_line_to_width;
-
-pub fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
-    if area.width < 24 || area.height < 8 {
-        // Paint a styled block over the area so stale cells from a previous
-        // (wider) frame don't persist as bleed-through artifacts (#400).
-        Block::default()
-            .style(Style::default().bg(app.ui_theme.surface_bg))
-            .render(area, f.buffer_mut());
-        return;
-    }
-
-    match app.sidebar_focus {
-        SidebarFocus::Auto => render_sidebar_auto(f, area, app),
-        SidebarFocus::Plan => render_sidebar_plan(f, area, app),
-        SidebarFocus::Todos => render_sidebar_todos(f, area, app),
-        SidebarFocus::Tasks => render_sidebar_tasks(f, area, app),
-        SidebarFocus::Agents => render_sidebar_subagents(f, area, app),
-        SidebarFocus::Context => render_context_panel(f, area, app),
-    }
+#[derive(Debug, Clone, Default)]
+pub struct SidebarAgentRow {
+    pub id: String,
+    pub parent_run_id: Option<String>,
+    pub name: String,
+    pub model: Option<String>,
+    pub status: String,
+    pub steps_taken: u32,
+    pub duration_ms: Option<u64>,
+    /// `(settled, total)` over this row's direct children, when it has any
+    /// (#5479). A fan-out parent's own status says nothing about whether the
+    /// work it launched is finished; this is the "5/6 agents done" fact the
+    /// rail otherwise makes you count by eye. `None` for a leaf.
+    pub children_settled: Option<(usize, usize)>,
 }
 
-/// Build the Auto-mode panel stack. Empty panels collapse to zero height so
-/// non-empty ones get the full sidebar real estate. Without this, Plan got
-/// clipped because Todos/Tasks/Agents each reserved 25% of the height even
-/// when they had nothing to show. Plan is always rendered (it owns the
-/// session-wide empty-state hint).
-fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &App) {
-    #[derive(Clone, Copy)]
-    enum Panel {
-        Plan,
-        Todos,
-        Tasks,
-        Agents,
-        Context,
-    }
-
-    let todos_empty = app
-        .todos
-        .try_lock()
-        .map(|todos| todos.snapshot().items.is_empty())
-        .unwrap_or(false); // assume non-empty when locked so we don't hide updating data
-    let tasks_empty = app.runtime_turn_id.is_none() && app.task_panel.is_empty();
-    let agents_empty = app.subagent_cache.is_empty()
-        && app.agent_progress.is_empty()
-        && active_fanout_counts(app).is_none()
-        && !foreground_rlm_running(app);
-
-    let mut visible: Vec<Panel> = Vec::with_capacity(5);
-    visible.push(Panel::Plan);
-    if !todos_empty {
-        visible.push(Panel::Todos);
-    }
-    if !tasks_empty {
-        visible.push(Panel::Tasks);
-    }
-    if !agents_empty {
-        visible.push(Panel::Agents);
-    }
-    if app.context_panel {
-        visible.push(Panel::Context);
-    }
-
-    let constraints: Vec<Constraint> = match visible.len() {
-        1 => vec![Constraint::Min(0)],
-        2 => vec![Constraint::Percentage(50), Constraint::Min(0)],
-        3 => vec![
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Min(0),
-        ],
-        4 => vec![
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Min(6),
-        ],
-        _ => vec![
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Min(6),
-        ],
-    };
-
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
-    for (panel, rect) in visible.iter().zip(sections.iter()) {
-        match panel {
-            Panel::Plan => render_sidebar_plan(f, *rect, app),
-            Panel::Todos => render_sidebar_todos(f, *rect, app),
-            Panel::Tasks => render_sidebar_tasks(f, *rect, app),
-            Panel::Agents => render_sidebar_subagents(f, *rect, app),
-            Panel::Context => render_context_panel(f, *rect, app),
-        }
-    }
-}
-
-/// The Plan section is the **single source of truth for the
-/// `update_plan` tool's output** (#408). It is intentionally distinct
-/// from the Todos section: todos are checklist work items the user
-/// or model is tracking; plan steps are the model's higher-level
-/// strategy as recorded by `update_plan`. The panel also hosts two
-/// session-wide indicators that don't fit the other sections — Goal
-/// (`/goal`) and the cycle counter (#124) — because they share the
-/// "what's the agent trying to do, big-picture" theme.
+/// The name a sub-agent was dispatched under, when it has one (#5287).
 ///
-/// When the panel is fully empty (no goal, no cycles, no plan) it
-/// renders as a quiet section with a single dim hint at the bottom
-/// rather than the blunt "No active plan" placeholder it used to show.
-/// That kept the user wondering whether the panel was broken; the
-/// hint instead tells them what the panel is for and how to populate
-/// it.
-fn render_sidebar_plan(f: &mut Frame, area: Rect, app: &App) {
-    if area.height < 3 {
-        return;
-    }
-
-    let theme = Theme::for_palette_mode(app.ui_theme.mode);
-    let content_width = area.width.saturating_sub(4) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height).max(4));
-
-    // === Goal Mode (#397) — gold outline matching todo items ===
-    if let Some(ref objective) = app.goal.goal_objective {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "◆ {}",
-                truncate_line_to_width(objective, content_width.max(1))
-            ),
-            Style::default()
-                .fg(palette::STATUS_WARNING)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )));
-        if let Some(budget) = app.goal.goal_token_budget {
-            let used = app.session.total_conversation_tokens;
-            let pct = if budget > 0 {
-                ((used as f64 / budget as f64) * 100.0).min(100.0)
-            } else {
-                0.0
-            };
-            let bar_width = content_width.min(20);
-            let filled = ((pct / 100.0) * bar_width as f64) as usize;
-            let bar = format!(
-                "[{}{}] {:.0}%",
-                "█".repeat(filled),
-                "░".repeat(bar_width.saturating_sub(filled)),
-                pct
-            );
-            lines.push(Line::from(Span::styled(
-                format!("  tokens: {used}/{budget} {}", bar),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
-        }
-        // Gold separator
-        lines.push(Line::from(Span::styled(
-            "─".repeat(content_width.min(24)),
-            Style::default().fg(palette::STATUS_WARNING),
-        )));
-    }
-
-    // Cycle indicator (issue #124). Only shown once a boundary has fired —
-    // first-time users with cycle_count == 0 don't need this row of chrome.
-    if app.cycle_count > 0 {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "cycles: {} (active: {})",
-                app.cycle_count,
-                app.cycle_count.saturating_add(1)
-            ),
-            Style::default().fg(theme.plan_summary_color),
-        )));
-    }
-
-    match app.plan_state.try_lock() {
-        Ok(plan) => {
-            if plan.is_empty() {
-                // The blunt "No active plan" placeholder used to land
-                // here on every render with no plan steps, even when the
-                // user had a goal set or had cycled — making the panel
-                // look broken. After #408 we instead emit a quiet hint
-                // that explains what the panel is for, but only when
-                // *all* of the panel's signals are empty so we don't
-                // crowd a panel that already has a goal / cycle
-                // indicator above.
-                let nothing_above = app.goal.goal_objective.is_none() && app.cycle_count == 0;
-                if nothing_above {
-                    lines.push(Line::from(Span::styled(
-                        plan_panel_empty_hint(content_width.max(1)),
-                        Style::default().fg(palette::TEXT_MUTED).italic(),
-                    )));
-                }
-            } else {
-                let (pending, in_progress, completed) = plan.counts();
-                let total = pending + in_progress + completed;
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{}%", plan.progress_percent()),
-                        Style::default().fg(theme.plan_progress_color).bold(),
-                    ),
-                    Span::styled(
-                        format!(" complete ({completed}/{total})"),
-                        Style::default().fg(theme.plan_summary_color),
-                    ),
-                ]));
-
-                if let Some(explanation) = plan.explanation() {
-                    lines.push(Line::from(Span::styled(
-                        truncate_line_to_width(explanation, content_width.max(1)),
-                        Style::default().fg(theme.plan_explanation_color),
-                    )));
-                }
-
-                let usable_rows = area.height.saturating_sub(3) as usize;
-                let max_steps = usable_rows.saturating_sub(lines.len());
-                for step in plan.steps().iter().take(max_steps) {
-                    let (prefix, color) = match &step.status {
-                        StepStatus::Pending => ("[ ]", theme.plan_pending_color),
-                        StepStatus::InProgress => ("[~]", theme.plan_in_progress_color),
-                        StepStatus::Completed => ("[x]", theme.plan_completed_color),
-                    };
-                    let mut text = format!("{prefix} {}", step.text);
-                    let elapsed = step.elapsed_str();
-                    if !elapsed.is_empty() {
-                        let _ = write!(text, " ({elapsed})");
-                    }
-                    lines.push(Line::from(Span::styled(
-                        truncate_line_to_width(&text, content_width.max(1)),
-                        Style::default().fg(color),
-                    )));
-                }
-
-                let remaining = plan.steps().len().saturating_sub(max_steps);
-                if remaining > 0 {
-                    lines.push(Line::from(Span::styled(
-                        format!("+{remaining} more steps"),
-                        Style::default().fg(theme.plan_summary_color),
-                    )));
-                }
-            }
-        }
-        Err(_) => {
-            lines.push(Line::from(Span::styled(
-                "Plan state updating...",
-                Style::default().fg(theme.plan_summary_color),
-            )));
-        }
-    }
-
-    render_sidebar_section(f, area, "Plan", lines, app);
+/// `SubAgentResult::name` carries the session name, which the manager seeds
+/// with the agent id and only replaces when the dispatch supplied a name. An
+/// id is a lookup handle, never the identity an operator dispatched by, so it
+/// is reported as absent here and the caller falls back to its own chain.
+pub(crate) fn dispatched_agent_name(
+    agent: &crate::tools::subagent::SubAgentResult,
+) -> Option<&str> {
+    let name = agent.name.trim();
+    (!name.is_empty() && name != agent.agent_id).then_some(name)
 }
 
-/// One-line hint shown when the Plan section has nothing to display
-/// (no goal, no cycle, no steps). Ellipsizes for narrow widths so
-/// even a 24-column sidebar doesn't wrap mid-word. Visible across
-/// modes — the panel's role doesn't change between Plan / Agent /
-/// YOLO; only its content does.
-#[must_use]
-fn plan_panel_empty_hint(content_width: usize) -> String {
-    let full = "tracks update_plan / /goal / cycles";
-    truncate_line_to_width(full, content_width)
-}
-
-fn render_sidebar_todos(f: &mut Frame, area: Rect, app: &App) {
-    if area.height < 3 {
-        return;
-    }
-
-    let content_width = area.width.saturating_sub(4) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height).max(4));
-
-    match app.todos.try_lock() {
-        Ok(todos) => {
-            let snapshot = todos.snapshot();
-            if snapshot.items.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "No todos",
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            } else {
-                let total = snapshot.items.len();
-                let completed = snapshot
-                    .items
-                    .iter()
-                    .filter(|item| item.status == TodoStatus::Completed)
-                    .count();
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{}%", snapshot.completion_pct),
-                        Style::default().fg(palette::STATUS_SUCCESS).bold(),
-                    ),
-                    Span::styled(
-                        format!(" complete ({completed}/{total})"),
-                        Style::default().fg(palette::TEXT_MUTED),
-                    ),
-                ]));
-
-                let usable_rows = area.height.saturating_sub(3) as usize;
-                let max_items = usable_rows.saturating_sub(lines.len());
-                for item in snapshot.items.iter().take(max_items) {
-                    let (prefix, color) = match item.status {
-                        TodoStatus::Pending => ("[ ]", palette::TEXT_MUTED),
-                        TodoStatus::InProgress => ("[~]", palette::STATUS_WARNING),
-                        TodoStatus::Completed => ("[x]", palette::STATUS_SUCCESS),
-                    };
-                    let text = format!("{prefix} #{} {}", item.id, item.content);
-                    lines.push(Line::from(Span::styled(
-                        truncate_line_to_width(&text, content_width.max(1)),
-                        Style::default().fg(color),
-                    )));
-                }
-
-                let remaining = snapshot.items.len().saturating_sub(max_items);
-                if remaining > 0 {
-                    lines.push(Line::from(Span::styled(
-                        format!("+{remaining} more todos"),
-                        Style::default().fg(palette::TEXT_MUTED),
-                    )));
-                }
-            }
-        }
-        Err(_) => {
-            lines.push(Line::from(Span::styled(
-                "Todo list updating...",
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
-        }
-    }
-
-    render_sidebar_section(f, area, "Todos", lines, app);
-}
-
-fn render_sidebar_tasks(f: &mut Frame, area: Rect, app: &App) {
-    if area.height < 3 {
-        return;
-    }
-
-    let content_width = area.width.saturating_sub(4) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height).max(4));
-
-    if let Some(turn_id) = app.runtime_turn_id.as_ref() {
-        let status = app
-            .runtime_turn_status
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_string();
-        lines.push(Line::from(Span::styled(
-            truncate_line_to_width(
-                &format!("turn {} ({status})", truncate_line_to_width(turn_id, 12)),
-                content_width.max(1),
-            ),
-            Style::default().fg(palette::DEEPSEEK_SKY),
-        )));
-    }
-
-    if app.task_panel.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No active tasks",
-            Style::default().fg(palette::TEXT_MUTED),
-        )));
-    } else {
-        let running = app
-            .task_panel
-            .iter()
-            .filter(|task| task.status == "running")
-            .count();
-        lines.push(Line::from(vec![
-            Span::styled(
-                if running == app.task_panel.len() {
-                    format!("{running} running")
-                } else {
-                    format!("{} active", app.task_panel.len())
-                },
-                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
-            ),
-            Span::styled(
-                if running == app.task_panel.len() {
-                    String::new()
-                } else {
-                    format!(" ({running} running)")
-                },
-                Style::default().fg(palette::TEXT_MUTED),
-            ),
-        ]));
-
-        let usable_rows = area.height.saturating_sub(3) as usize;
-        let max_items = usable_rows.saturating_sub(lines.len());
-        for task in app.task_panel.iter().take(max_items) {
-            let color = match task.status.as_str() {
-                "queued" => palette::TEXT_MUTED,
-                "running" => palette::STATUS_WARNING,
-                "completed" => palette::STATUS_SUCCESS,
-                "failed" => palette::STATUS_ERROR,
-                "canceled" => palette::TEXT_DIM,
-                _ => palette::TEXT_MUTED,
-            };
-            let duration = task
-                .duration_ms
-                .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
-                .unwrap_or_else(|| "-".to_string());
-            let label = format!(
-                "{} {} {}",
-                truncate_line_to_width(&task.id, 10),
-                task.status,
-                duration
-            );
-            lines.push(Line::from(Span::styled(
-                truncate_line_to_width(&label, content_width.max(1)),
-                Style::default().fg(color),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {}",
-                    truncate_line_to_width(
-                        &task.prompt_summary,
-                        content_width.saturating_sub(2).max(1)
-                    )
-                ),
-                Style::default().fg(palette::TEXT_DIM),
-            )));
-        }
-    }
-
-    render_sidebar_section(f, area, "Tasks", lines, app);
-}
-
-fn render_sidebar_subagents(f: &mut Frame, area: Rect, app: &App) {
-    if area.height < 3 {
-        return;
-    }
-
-    let content_width = area.width.saturating_sub(4) as usize;
-
-    // Demoted to navigator (issue #128): the in-transcript DelegateCard /
-    // FanoutCard now carries the live action tree and dot-grid. The sidebar
-    // shows just count + role-mix so the user can scan parallel work at a
-    // glance and scroll to the matching transcript card for detail.
+pub(crate) fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
     let cached_ids: std::collections::HashSet<&str> = app
         .subagent_cache
         .iter()
         .map(|agent| agent.agent_id.as_str())
         .collect();
-    let progress_only_count = app
-        .agent_progress
-        .keys()
-        .filter(|id| !cached_ids.contains(id.as_str()))
-        .count();
-    let cached_running = app
-        .subagent_cache
-        .iter()
-        .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
-        .count();
-    let role_counts: std::collections::BTreeMap<String, usize> =
+    let display_names = localized_whale_display_names(
         app.subagent_cache
             .iter()
-            .fold(std::collections::BTreeMap::new(), |mut acc, agent| {
-                *acc.entry(agent.agent_type.as_str().to_string())
-                    .or_insert(0) += 1;
-                acc
-            });
-    let (fanout_running, fanout_total) = active_fanout_counts(app)
-        .map(|(running, total)| (running, Some(total)))
-        .unwrap_or((0, None));
-    let foreground_rlm_running = foreground_rlm_running(app);
-
-    let summary = SidebarSubagentSummary {
-        cached_total: app.subagent_cache.len(),
-        cached_running,
-        progress_only_count,
-        fanout_total,
-        fanout_running,
-        foreground_rlm_running,
-        role_counts,
-    };
-    let lines = subagent_navigator_lines(&summary, content_width);
-
-    render_sidebar_section(f, area, "Agents", lines, app);
-}
-
-/// Minimal projection of the data the sub-agent sidebar needs. Lifted out
-/// of `render_sidebar_subagents` so the rendering can be snapshot-tested
-/// without a full `App`.
-#[derive(Debug, Clone, Default)]
-pub struct SidebarSubagentSummary {
-    pub cached_total: usize,
-    pub cached_running: usize,
-    pub progress_only_count: usize,
-    pub fanout_total: Option<usize>,
-    pub fanout_running: usize,
-    pub foreground_rlm_running: bool,
-    pub role_counts: std::collections::BTreeMap<String, usize>,
-}
-
-fn foreground_rlm_running(app: &App) -> bool {
-    app.active_cell.as_ref().is_some_and(|active| {
-        active.entries().iter().any(|entry| {
-            matches!(
-                entry,
-                HistoryCell::Tool(ToolCell::Generic(generic))
-                    if generic.name == "rlm" && generic.status == ToolStatus::Running
-            )
+            .map(|agent| (agent.agent_id.as_str(), agent.nickname.as_deref())),
+        app.ui_locale.tag(),
+    );
+    let mut rows: Vec<SidebarAgentRow> = app
+        .subagent_cache
+        .iter()
+        .map(|agent| {
+            let current_activity = app
+                .agent_progress_meta
+                .get(&agent.agent_id)
+                .and_then(|meta| meta.current_activity.as_ref());
+            // The dispatch name leads (#5287). Generated whales name the
+            // agents that have none, locale-derived from the neutral agent
+            // id; never replay a persisted label from another language.
+            let display_name = dispatched_agent_name(agent)
+                .map(str::to_string)
+                .or_else(|| {
+                    agent
+                        .child_route
+                        .as_ref()
+                        .and_then(|route| route.resolved_profile_id.as_deref())
+                        .map(str::trim)
+                        .filter(|profile| !profile.is_empty())
+                        .map(str::to_string)
+                })
+                .or_else(|| display_names.get(&agent.agent_id).cloned())
+                .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned())
+                .unwrap_or_else(|| agent.name.clone());
+            SidebarAgentRow {
+                id: agent.agent_id.clone(),
+                parent_run_id: agent.parent_run_id.clone(),
+                name: display_name,
+                model: Some(agent.model.clone()).filter(|model| !model.trim().is_empty()),
+                status: current_activity
+                    .map(|activity| sidebar_current_activity_status_text(activity.status))
+                    .or_else(|| agent.worker_status.map(sidebar_worker_status_text))
+                    .unwrap_or_else(|| subagent_status_text(&agent.status))
+                    .to_string(),
+                steps_taken: agent.steps_taken,
+                duration_ms: Some(agent.duration_ms),
+                // Filled in by `annotate_child_progress` once every row exists.
+                children_settled: None,
+            }
         })
-    })
-}
+        .collect();
 
-/// Build the demoted navigator lines from a summary projection. Public
-/// for the snapshot test in this module.
-pub fn subagent_navigator_lines(
-    summary: &SidebarSubagentSummary,
-    content_width: usize,
-) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(4);
-
-    let fanout_total = summary.fanout_total.unwrap_or(0);
-    if summary.cached_total == 0
-        && summary.progress_only_count == 0
-        && fanout_total == 0
-        && !summary.foreground_rlm_running
-    {
-        lines.push(Line::from(Span::styled(
-            "No agents",
-            Style::default().fg(palette::TEXT_MUTED),
-        )));
-        return lines;
-    }
-
-    let (live_running, total) = if let Some(total) = summary.fanout_total {
-        (summary.fanout_running, total)
-    } else {
-        (
-            summary.cached_running + summary.progress_only_count,
-            summary.cached_total + summary.progress_only_count,
-        )
-    };
-    let done = total.saturating_sub(live_running);
-    let header = if live_running > 0 {
-        vec![
-            Span::styled(
-                format!("{live_running} running"),
-                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
-            ),
-            Span::styled(
-                format!(" / {total}"),
-                Style::default().fg(palette::TEXT_MUTED),
-            ),
-        ]
-    } else {
-        vec![Span::styled(
-            format!("{done} done"),
-            Style::default().fg(palette::STATUS_SUCCESS),
-        )]
-    };
-    lines.push(Line::from(header));
-
-    if !summary.role_counts.is_empty() {
-        let mix: Vec<String> = summary
-            .role_counts
+    rows.extend(
+        app.agent_progress
             .iter()
-            .map(|(role, count)| format!("{count} {role}"))
-            .collect();
-        let role_line = mix.join(" \u{00B7} ");
-        lines.push(Line::from(Span::styled(
-            truncate_line_to_width(&role_line, content_width.max(1)),
-            Style::default().fg(palette::TEXT_DIM),
-        )));
-    }
-
-    if summary.foreground_rlm_running {
-        lines.push(Line::from(vec![
-            Span::styled("RLM", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
-            Span::styled(
-                " foreground work active",
-                Style::default().fg(palette::TEXT_DIM),
-            ),
-        ]));
-    }
-
-    lines.push(Line::from(Span::styled(
-        "(see transcript card for detail)",
-        Style::default().fg(palette::TEXT_MUTED).italic(),
-    )));
-
-    lines
-}
-
-/// Session-context panel (#504) — consolidated session state overview.
-///
-/// Surfaces at-a-glance: working set, token usage / context %, running
-/// cost, MCP server count, LSP toggle state, cycle count, and memory
-/// file size + mtime. Each section is a compact one-liner so the panel
-/// reads as a dashboard rather than a scrolling list.
-fn render_context_panel(f: &mut Frame, area: Rect, app: &App) {
-    if area.height < 3 {
-        return;
-    }
-
-    let content_width = area.width.saturating_sub(4) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height).max(4));
-
-    // ── Working set ──────────────────────────────────────────────
-    let ws_name = app
-        .workspace
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("(root)")
-        .to_string();
-    lines.push(Line::from(vec![
-        Span::styled(
-            truncate_line_to_width(&ws_name, content_width.max(1)),
-            Style::default().fg(palette::DEEPSEEK_SKY).bold(),
-        ),
-        Span::styled(
-            format!("  {}", app.workspace_context.as_deref().unwrap_or("")),
-            Style::default().fg(palette::TEXT_DIM),
-        ),
-    ]));
-
-    // ── Token usage ──────────────────────────────────────────────
-    let total_tokens = app.session.total_conversation_tokens;
-    let window = crate::models::context_window_for_model(&app.model).unwrap_or(1_048_576);
-    let pct = if window > 0 {
-        ((total_tokens as f64 / window as f64) * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
-    let bar_width = content_width.min(20);
-    let filled = ((pct / 100.0) * bar_width as f64) as usize;
-    let bar = format!(
-        "[{}{}] {:.0}%",
-        "█".repeat(filled),
-        "░".repeat(bar_width.saturating_sub(filled)),
-        pct
-    );
-    lines.push(Line::from(Span::styled(
-        format!(
-            "context: {}/{} tokens  {}",
-            total_tokens,
-            window,
-            truncate_line_to_width(&bar, content_width.saturating_sub(32).max(8))
-        ),
-        Style::default().fg(palette::TEXT_MUTED),
-    )));
-
-    // ── Session cost ─────────────────────────────────────────────
-    let total_cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    let session_cost = app.session_cost_for_currency(app.cost_currency);
-    let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
-    lines.push(Line::from(Span::styled(
-        format!(
-            "cost: {} (session {} + agents {})",
-            app.format_cost_amount(total_cost),
-            app.format_cost_amount(session_cost),
-            app.format_cost_amount(agent_cost)
-        ),
-        Style::default().fg(palette::TEXT_MUTED),
-    )));
-
-    // ── MCP servers ──────────────────────────────────────────────
-    if app.mcp_configured_count > 0 {
-        let restart_hint = if app.mcp_restart_required {
-            " (restart needed)"
-        } else {
-            ""
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "mcp: {} server(s){}",
-                app.mcp_configured_count, restart_hint
-            ),
-            Style::default().fg(palette::TEXT_MUTED),
-        )));
-    }
-
-    // ── LSP ──────────────────────────────────────────────────────
-    let lsp_label = if app.lsp_enabled { "on" } else { "off" };
-    lines.push(Line::from(Span::styled(
-        format!("lsp: {}", lsp_label),
-        Style::default().fg(palette::TEXT_MUTED),
-    )));
-
-    // ── Cycles ───────────────────────────────────────────────────
-    if app.cycle_count > 0 {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "cycles: {} crossed, {} briefing(s)",
-                app.cycle_count,
-                app.cycle_briefings.len()
-            ),
-            Style::default().fg(palette::TEXT_MUTED),
-        )));
-    }
-
-    // ── Memory ───────────────────────────────────────────────────
-    if app.use_memory {
-        let size_hint = std::fs::metadata(&app.memory_path)
-            .map(|m| m.len())
-            .map(|bytes| {
-                if bytes >= 1024 * 1024 {
-                    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-                } else if bytes >= 1024 {
-                    format!("{:.1} KB", bytes as f64 / 1024.0)
-                } else {
-                    format!("{} B", bytes)
+            .filter(|(id, _)| !cached_ids.contains(id.as_str()))
+            .map(|(id, _progress)| {
+                // Progress-only rows do not carry a generated whale name yet;
+                // keep their existing stable Agent-N placeholder until the
+                // manager snapshot arrives.
+                let display_name = app
+                    .agent_label_map
+                    .get(id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| id.clone());
+                let meta = app.agent_progress_meta.get(id.as_str());
+                let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
+                SidebarAgentRow {
+                    id: id.clone(),
+                    parent_run_id: meta.and_then(|meta| meta.parent_run_id.clone()),
+                    name: display_name,
+                    model: meta.and_then(|meta| meta.resolved_model.clone()),
+                    status: current_activity
+                        .map(|activity| sidebar_current_activity_status_text(activity.status))
+                        .unwrap_or(sidebar_worker_status_text(AgentWorkerStatus::Running))
+                        .to_string(),
+                    steps_taken: 0,
+                    duration_ms: None,
+                    children_settled: None,
                 }
-            })
-            .unwrap_or_else(|_| "—".to_string());
-        lines.push(Line::from(Span::styled(
-            format!("memory: {} ({})", app.memory_path.display(), size_hint),
-            Style::default().fg(palette::TEXT_MUTED),
-        )));
-    }
-
-    render_sidebar_section(f, area, "Session", lines, app);
-}
-
-fn render_sidebar_section(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    lines: Vec<Line<'static>>,
-    app: &App,
-) {
-    if area.width < 4 || area.height < 3 {
-        // Clear stale cells before bailing out (#400).
-        Block::default()
-            .style(Style::default().bg(app.ui_theme.surface_bg))
-            .render(area, f.buffer_mut());
-        return;
-    }
-
-    let theme = Theme::for_palette_mode(app.ui_theme.mode);
-    // Truncate the panel title so it always fits within the section width
-    // even after a resize. The title occupies up to 4 chars of border chrome
-    // (two spaces + one space on each side), so the max title length is
-    // area.width.saturating_sub(4) when borders are enabled.
-    let max_title_width = area.width.saturating_sub(4).max(1) as usize;
-    let display_title = truncate_line_to_width(title, max_title_width);
-
-    // Constrain lines to the visible section area so a Paragraph wrap
-    // overflow can't write cells outside the Block bounds (#400). The
-    // border + padding consume 2 rows; budget the rest for content.
-    let visible_content_rows = area
-        .height
-        .saturating_sub(2) // top + bottom border
-        .saturating_sub(theme.section_padding.top + theme.section_padding.bottom)
-        as usize;
-    let lines: Vec<Line<'static>> =
-        if lines.len() > visible_content_rows && visible_content_rows > 0 {
-            lines.into_iter().take(visible_content_rows).collect()
-        } else {
-            lines
-        };
-
-    let section = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-        Block::default()
-            .title(Line::from(vec![Span::styled(
-                format!(" {display_title} "),
-                Style::default().fg(theme.section_title_color).bold(),
-            )]))
-            .borders(theme.section_borders)
-            .border_type(theme.section_border_type)
-            .border_style(Style::default().fg(theme.section_border_color))
-            .style(Style::default().bg(theme.section_bg))
-            .padding(theme.section_padding),
+            }),
     );
 
-    f.render_widget(section, area);
+    let mut rows = sort_sidebar_agent_rows_as_tree(rows);
+    annotate_child_progress(&mut rows);
+    rows
+}
+
+/// Fill in each row's `children_settled` from its direct children.
+///
+/// Counted over the rows actually present: a child whose record has aged out of
+/// the ledger cannot be counted, and inventing a denominator that included it
+/// would misreport progress as worse than it is.
+fn annotate_child_progress(rows: &mut [SidebarAgentRow]) {
+    let mut totals: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for row in rows.iter() {
+        let Some(parent) = row.parent_run_id.as_deref() else {
+            continue;
+        };
+        let entry = totals.entry(parent.to_string()).or_insert((0, 0));
+        entry.1 += 1;
+        if sidebar_agent_status_is_terminal(row.status.as_str()) {
+            entry.0 += 1;
+        }
+    }
+    for row in rows.iter_mut() {
+        row.children_settled = totals.get(&row.id).copied();
+    }
+}
+
+fn sort_sidebar_agent_rows_as_tree(rows: Vec<SidebarAgentRow>) -> Vec<SidebarAgentRow> {
+    let known_ids: std::collections::HashSet<String> =
+        rows.iter().map(|row| row.id.clone()).collect();
+    let mut children: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut roots = Vec::new();
+
+    for (idx, row) in rows.iter().enumerate() {
+        if let Some(parent) = row.parent_run_id.as_deref()
+            && known_ids.contains(parent)
+        {
+            children.entry(parent.to_string()).or_default().push(idx);
+            continue;
+        }
+        roots.push(idx);
+    }
+
+    fn push_tree(
+        idx: usize,
+        rows: &[SidebarAgentRow],
+        children: &std::collections::HashMap<String, Vec<usize>>,
+        seen: &mut std::collections::HashSet<usize>,
+        order: &mut Vec<usize>,
+    ) {
+        if !seen.insert(idx) {
+            return;
+        }
+        order.push(idx);
+        if let Some(child_indices) = children.get(&rows[idx].id) {
+            for child_idx in child_indices {
+                push_tree(*child_idx, rows, children, seen, order);
+            }
+        }
+    }
+
+    let mut order = Vec::with_capacity(rows.len());
+    let mut seen = std::collections::HashSet::new();
+    for idx in roots {
+        push_tree(idx, &rows, &children, &mut seen, &mut order);
+    }
+    for idx in 0..rows.len() {
+        push_tree(idx, &rows, &children, &mut seen, &mut order);
+    }
+
+    // Materialize by move instead of cloning each row a second time (#3898):
+    // `seen` guarantees every index lands in `order` exactly once, so each
+    // slot is taken exactly once and no row is dropped.
+    let mut slots: Vec<Option<SidebarAgentRow>> = rows.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|idx| slots[idx].take().expect("each row emitted exactly once"))
+        .collect()
+}
+
+fn subagent_status_text(status: &SubAgentStatus) -> &'static str {
+    match status {
+        SubAgentStatus::Running => "running",
+        SubAgentStatus::Completed => "done",
+        SubAgentStatus::Interrupted(_) => "interrupted",
+        SubAgentStatus::Failed(_) => "failed",
+        SubAgentStatus::Cancelled => "canceled",
+        SubAgentStatus::BudgetExhausted => "budget",
+    }
+}
+
+fn sidebar_worker_status_text(status: AgentWorkerStatus) -> &'static str {
+    match status {
+        AgentWorkerStatus::Queued => "queued",
+        AgentWorkerStatus::Starting => "starting",
+        AgentWorkerStatus::Running => "running",
+        AgentWorkerStatus::WaitingForUser => "waiting",
+        AgentWorkerStatus::ModelWait => "model wait",
+        AgentWorkerStatus::RunningTool => "tool",
+        AgentWorkerStatus::Completed => "done",
+        AgentWorkerStatus::Failed => "failed",
+        AgentWorkerStatus::Cancelled => "canceled",
+        AgentWorkerStatus::Interrupted => "interrupted",
+    }
+}
+
+fn sidebar_current_activity_status_text(status: AgentCurrentActivityStatus) -> &'static str {
+    match status {
+        AgentCurrentActivityStatus::Queued => "queued",
+        AgentCurrentActivityStatus::Starting => "starting",
+        AgentCurrentActivityStatus::Running => "running",
+        AgentCurrentActivityStatus::ModelWait => "model wait",
+        AgentCurrentActivityStatus::RunningTool => "tool",
+        AgentCurrentActivityStatus::Waiting => "waiting",
+        AgentCurrentActivityStatus::Done => "done",
+        AgentCurrentActivityStatus::Failed => "failed",
+        AgentCurrentActivityStatus::Canceled => "canceled",
+        AgentCurrentActivityStatus::Interrupted => "interrupted",
+    }
+}
+
+fn sidebar_agent_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "done" | "canceled" | "failed" | "interrupted" | "budget"
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SidebarSubagentSummary, plan_panel_empty_hint, subagent_navigator_lines};
-    use ratatui::text::Line;
+    use super::sidebar_agent_rows;
+    use crate::config::Config;
+    use crate::localization::Locale;
+    use crate::tui::app::{
+        AgentCurrentActivity, AgentCurrentActivityStatus, AgentProgressMeta, App,
+        SidebarHoverSection, SidebarHoverState, TuiOptions,
+    };
+    use std::path::PathBuf;
 
-    fn lines_to_text(lines: &[Line<'static>]) -> Vec<String> {
-        lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
+    fn create_test_app() -> App {
+        let options = TuiOptions {
+            ..crate::test_support::test_tui_options(PathBuf::from("."))
+        };
+        let mut app = App::new(options, &Config::default());
+        // Legacy strip geometry (see ui.rs); Bottom default has its own tests.
+        app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::Top;
+        app
+    }
+
+    // ---- Sidebar hover tooltip tests ----
+
+    #[test]
+    fn sidebar_hover_state_default_is_empty() {
+        let state = SidebarHoverState::default();
+        assert!(state.sections.is_empty());
+    }
+
+    #[test]
+    fn sidebar_hover_section_stores_lines() {
+        use ratatui::layout::Rect;
+        let section = SidebarHoverSection {
+            content_area: Rect::new(1, 1, 38, 8),
+            lines: vec!["line 1".to_string(), "line 2".to_string()],
+            rows: vec![],
+        };
+        assert_eq!(section.lines.len(), 2);
+        assert_eq!(section.lines[0], "line 1");
+        assert!(section.content_area.x > 0);
+    }
+
+    #[test]
+    fn hover_line_matching_respects_content_area_offset() {
+        use ratatui::layout::Rect;
+        let section = SidebarHoverSection {
+            content_area: Rect::new(62, 2, 36, 6),
+            lines: vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string(),
+            ],
+            rows: vec![],
+        };
+
+        // Mouse within content area, first line
+        let line_idx = (2u16.saturating_sub(section.content_area.y)) as usize;
+        assert_eq!(section.lines[line_idx], "first");
+
+        // Mouse within content area, second line
+        let line_idx = (3u16.saturating_sub(section.content_area.y)) as usize;
+        assert_eq!(section.lines[line_idx], "second");
+
+        // Mouse outside content area (above) — row < content_area.y
+        assert!((1u16) < section.content_area.y);
+    }
+
+    // ── #3030: stable labels instead of raw internal ids ───────────────────
+
+    #[test]
+    fn ensure_agent_label_assigns_stable_sequential_labels() {
+        let mut app = create_test_app();
+        assert_eq!(app.ensure_agent_label("agent_aaa111"), "Agent 1");
+        assert_eq!(app.ensure_agent_label("agent_bbb222"), "Agent 2");
+        // Re-seeing a known agent keeps its original label.
+        assert_eq!(app.ensure_agent_label("agent_aaa111"), "Agent 1");
+        assert_eq!(app.agent_counter, 2);
+        // Read-only lookup falls back to the raw id for unknown agents.
+        assert_eq!(app.agent_display_label("agent_bbb222"), "Agent 2");
+        assert_eq!(app.agent_display_label("agent_zzz999"), "agent_zzz999");
+    }
+
+    #[test]
+    fn ensure_agent_label_prefers_identity_over_the_counter() {
+        let mut app = create_test_app();
+        let route = |profile: Option<&str>, role: &str| {
+            Some(crate::tools::subagent::ChildRouteReceipt {
+                requested_type: "custom".to_string(),
+                requested_profile: profile.map(str::to_string),
+                resolved_profile_id: None,
+                profile_origin: None,
+                canonical_role: role.to_string(),
+                provider_id: "deepseek".to_string(),
+                model_id: "deepseek-v4-pro".to_string(),
+                route_source: "roster".to_string(),
+                requested_reasoning: "inherit".to_string(),
+                effective_reasoning: None,
+                runtime_version: "test".to_string(),
+                runtime_build_sha: "unknown".to_string(),
             })
-            .collect()
-    }
-
-    // ---- #408 Plan panel empty-state hint ----
-
-    #[test]
-    fn plan_panel_empty_hint_mentions_panels_role() {
-        // The hint replaces the old "No active plan" placeholder; it
-        // should explain what the panel tracks so the user can tell
-        // whether the panel is broken vs simply unused this turn.
-        let hint = plan_panel_empty_hint(80);
-        assert!(
-            hint.contains("update_plan"),
-            "hint should name the tool: {hint:?}"
-        );
-        assert!(
-            hint.contains("/goal") || hint.contains("goal"),
-            "hint should mention /goal: {hint:?}"
-        );
-    }
-
-    #[test]
-    fn plan_panel_empty_hint_truncates_to_narrow_widths() {
-        // Width 16 forces an ellipsis; the hint should still fit.
-        let hint = plan_panel_empty_hint(16);
-        assert!(
-            hint.chars().count() <= 16,
-            "hint width {} > 16: {hint:?}",
-            hint.chars().count()
-        );
-    }
-
-    #[test]
-    fn plan_panel_empty_hint_does_not_say_no_active_plan() {
-        // Regression guard: the placeholder used to say "No active
-        // plan" which made the panel look broken. The hint should
-        // never re-introduce that wording.
-        let hint = plan_panel_empty_hint(80);
-        assert!(
-            !hint.to_ascii_lowercase().contains("no active plan"),
-            "hint regressed to old placeholder: {hint:?}"
-        );
-    }
-
-    #[test]
-    fn navigator_empty_state_says_no_agents() {
-        let summary = SidebarSubagentSummary::default();
-        let lines = subagent_navigator_lines(&summary, 32);
-        let text = lines_to_text(&lines);
-        assert_eq!(text, vec!["No agents".to_string()]);
-    }
-
-    #[test]
-    fn navigator_running_state_renders_count_role_and_navigator_hint() {
-        // Two general agents (one running, one done) + one explore (running).
-        let mut role_counts = std::collections::BTreeMap::new();
-        role_counts.insert("general".to_string(), 2);
-        role_counts.insert("explore".to_string(), 1);
-        let summary = SidebarSubagentSummary {
-            cached_total: 3,
-            cached_running: 2,
-            progress_only_count: 0,
-            fanout_total: None,
-            fanout_running: 0,
-            foreground_rlm_running: false,
-            role_counts,
-        };
-        let text = lines_to_text(&subagent_navigator_lines(&summary, 64));
-        assert!(text[0].contains("2 running"), "header: {:?}", text[0]);
-        assert!(text[0].contains("/ 3"), "total in header: {:?}", text[0]);
-        assert!(
-            text[1].contains("1 explore") && text[1].contains("2 general"),
-            "role mix line: {:?}",
-            text[1]
-        );
-        assert!(
-            text.iter().any(|l| l.contains("transcript card")),
-            "navigator hint must defer to transcript: {text:?}",
-        );
-    }
-
-    #[test]
-    fn navigator_uses_fanout_total_when_fanout_has_seeded_slots() {
-        let summary = SidebarSubagentSummary {
-            cached_total: 1,
-            cached_running: 1,
-            progress_only_count: 0,
-            fanout_total: Some(6),
-            fanout_running: 1,
-            foreground_rlm_running: false,
-            role_counts: std::collections::BTreeMap::new(),
         };
 
-        let text = lines_to_text(&subagent_navigator_lines(&summary, 64));
+        let mut named = cached_agent("agent_named", None);
+        named.name = "branch-triage".to_string();
+        app.subagent_cache.push(named);
 
-        assert!(text[0].contains("1 running"), "header: {:?}", text[0]);
-        assert!(text[0].contains("/ 6"), "fanout total: {:?}", text[0]);
+        let mut role = cached_agent("agent_role", None);
+        role.assignment.role = Some("reviewer".to_string());
+        app.subagent_cache.push(role);
+
+        let mut profile = cached_agent("agent_profile", None);
+        profile.assignment.role = None;
+        profile.child_route = route(Some("release-lead"), "custom");
+        app.subagent_cache.push(profile);
+
+        let mut canonical = cached_agent("agent_canonical", None);
+        canonical.assignment.role = None;
+        canonical.child_route = route(None, "planner");
+        app.subagent_cache.push(canonical);
+
+        let mut typed = cached_agent("agent_typed", None);
+        typed.assignment.role = None;
+        typed.agent_type = crate::tools::subagent::FleetRole::Builder;
+        app.subagent_cache.push(typed);
+
+        // The dispatch name leads, annotated with the role when the role is
+        // not already part of the name.
+        assert_eq!(
+            app.ensure_agent_label("agent_named"),
+            "branch-triage · general"
+        );
+        // Unnamed children are disambiguated per role (each role's counter
+        // starts at 1).
+        assert_eq!(app.ensure_agent_label("agent_role"), "reviewer · 1");
+        assert_eq!(app.ensure_agent_label("agent_profile"), "release-lead · 1");
+        assert_eq!(app.ensure_agent_label("agent_canonical"), "planner · 1");
+        assert_eq!(app.ensure_agent_label("agent_typed"), "implement · 1");
+
+        // A progress-only agent first seen before its metadata arrives gets a
+        // counter placeholder, then upgrades once the identity is observed.
+        assert_eq!(app.ensure_agent_label("agent_late"), "Agent 1");
+        let mut late = cached_agent("agent_late", None);
+        late.assignment.role = Some("verifier".to_string());
+        app.subagent_cache.push(late);
+        assert_eq!(app.ensure_agent_label("agent_late"), "test · 1");
     }
 
     #[test]
-    fn navigator_settled_state_says_done() {
-        let mut role_counts = std::collections::BTreeMap::new();
-        role_counts.insert("general".to_string(), 1);
-        let summary = SidebarSubagentSummary {
-            cached_total: 1,
-            cached_running: 0,
-            progress_only_count: 0,
-            fanout_total: None,
-            fanout_running: 0,
-            foreground_rlm_running: false,
-            role_counts,
-        };
-        let text = lines_to_text(&subagent_navigator_lines(&summary, 32));
-        assert!(text[0].contains("1 done"), "settled header: {:?}", text[0]);
+    fn ensure_agent_label_disambiguates_concurrent_same_role_children() {
+        let mut app = create_test_app();
+
+        let mut first = cached_agent("agent_builder_a", None);
+        first.assignment.role = None;
+        first.agent_type = crate::tools::subagent::FleetRole::Builder;
+        app.subagent_cache.push(first);
+
+        let mut second = cached_agent("agent_builder_b", None);
+        second.assignment.role = None;
+        second.agent_type = crate::tools::subagent::FleetRole::Builder;
+        app.subagent_cache.push(second);
+
+        assert_eq!(app.ensure_agent_label("agent_builder_a"), "implement · 1");
+        assert_eq!(app.ensure_agent_label("agent_builder_b"), "implement · 2");
+        // Stability: re-seeing a known builder keeps its assigned label.
+        assert_eq!(app.ensure_agent_label("agent_builder_a"), "implement · 1");
+        assert_eq!(app.ensure_agent_label("agent_builder_b"), "implement · 2");
+
+        // A different role has its own sequence.
+        let mut reviewer = cached_agent("agent_reviewer_a", None);
+        reviewer.assignment.role = Some("reviewer".to_string());
+        app.subagent_cache.push(reviewer);
+        assert_eq!(app.ensure_agent_label("agent_reviewer_a"), "reviewer · 1");
     }
 
     #[test]
-    fn navigator_truncates_long_role_mix_to_content_width() {
-        // Build a wide role mix; assert it doesn't blow past content_width.
-        let mut role_counts = std::collections::BTreeMap::new();
-        for role in ["general", "explore", "plan", "review", "custom", "extra"] {
-            role_counts.insert(role.to_string(), 1);
+    fn ensure_agent_label_named_child_skips_role_suffix_when_present() {
+        let mut app = create_test_app();
+
+        let mut named = cached_agent("agent_named", None);
+        named.name = "release-lead".to_string();
+        named.assignment.role = None;
+        named.child_route = Some(crate::tools::subagent::ChildRouteReceipt {
+            requested_type: "custom".to_string(),
+            requested_profile: Some("release-lead".to_string()),
+            resolved_profile_id: None,
+            profile_origin: None,
+            canonical_role: "release-lead".to_string(),
+            provider_id: "deepseek".to_string(),
+            model_id: "deepseek-v4-pro".to_string(),
+            route_source: "roster".to_string(),
+            requested_reasoning: "inherit".to_string(),
+            effective_reasoning: None,
+            runtime_version: "test".to_string(),
+            runtime_build_sha: "unknown".to_string(),
+        });
+        app.subagent_cache.push(named);
+
+        // The role is already part of the name, so no duplicate suffix.
+        assert_eq!(app.ensure_agent_label("agent_named"), "release-lead");
+    }
+
+    fn cached_agent(
+        agent_id: &str,
+        nickname: Option<&str>,
+    ) -> crate::tools::subagent::SubAgentResult {
+        crate::tools::subagent::SubAgentResult {
+            // An unnamed dispatch: the manager seeds `name` with the agent id
+            // and only replaces it when the caller supplied one.
+            name: agent_id.to_string(),
+            agent_id: agent_id.to_string(),
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            workspace: None,
+            git_branch: None,
+            agent_type: crate::tools::subagent::FleetRole::Worker,
+            assignment: crate::tools::subagent::SubAgentAssignment {
+                objective: "task".to_string(),
+                role: Some("worker".to_string()),
+            },
+            model: String::new(),
+            nickname: nickname.map(str::to_string),
+            status: crate::tools::subagent::SubAgentStatus::Running,
+            worker_status: None,
+            runtime_permissions: None,
+            parent_run_id: None,
+            spawn_depth: 0,
+            child_route: None,
+            result: None,
+            steps_taken: 1,
+            checkpoint: None,
+            needs_input: None,
+            duration_ms: 100,
+            started_at: None,
+            from_prior_session: false,
         }
-        let summary = SidebarSubagentSummary {
-            cached_total: 6,
-            cached_running: 6,
-            progress_only_count: 0,
-            fanout_total: None,
-            fanout_running: 0,
-            foreground_rlm_running: false,
-            role_counts,
-        };
-        let lines = subagent_navigator_lines(&summary, 16);
-        let role_line: &str = lines[1]
-            .spans
-            .first()
-            .map(|s| s.content.as_ref())
-            .unwrap_or("");
-        assert!(
-            role_line.chars().count() <= 16,
-            "role line {role_line:?} exceeded content_width"
+    }
+
+    // === #5479: a fan-out parent shows how much of its fan-out is done ===
+
+    #[test]
+    fn a_fanout_parent_row_reports_how_many_children_have_settled() {
+        let mut app = create_test_app();
+        let parent = cached_agent("workflow_parent", None);
+        for index in 0..6 {
+            let mut child = cached_agent(&format!("child_{index}"), None);
+            child.parent_run_id = Some("workflow_parent".to_string());
+            child.spawn_depth = 1;
+            if index < 5 {
+                child.status = crate::tools::subagent::SubAgentStatus::Completed;
+                child.worker_status = Some(crate::tools::subagent::AgentWorkerStatus::Completed);
+            }
+            app.subagent_cache.push(child);
+        }
+        app.subagent_cache.push(parent);
+
+        let rows = sidebar_agent_rows(&app);
+        let parent_row = rows
+            .iter()
+            .find(|row| row.id == "workflow_parent")
+            .expect("parent row");
+        assert_eq!(
+            parent_row.children_settled,
+            Some((5, 6)),
+            "the parent's own status says nothing about its fan-out"
+        );
+        for row in rows.iter().filter(|row| row.id != "workflow_parent") {
+            assert_eq!(
+                row.children_settled, None,
+                "a leaf must not claim a fan-out it does not have"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_whose_children_aged_out_reports_no_progress_rather_than_zero() {
+        // A denominator that counted rows no longer in the ledger would report
+        // progress as worse than it is.
+        let mut app = create_test_app();
+        app.subagent_cache.push(cached_agent("lonely_parent", None));
+        let rows = sidebar_agent_rows(&app);
+        assert_eq!(rows[0].children_settled, None);
+    }
+
+    #[test]
+    fn sidebar_agent_rows_use_worker_status_from_cached_agents() {
+        let mut app = create_test_app();
+        let mut agent = cached_agent("agent_model_wait", Some("Blue"));
+        agent.worker_status = Some(crate::tools::subagent::AgentWorkerStatus::ModelWait);
+        app.subagent_cache.push(agent);
+
+        let rows = sidebar_agent_rows(&app);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "model wait");
+    }
+
+    #[test]
+    fn sidebar_agent_rows_project_typed_lifecycle_fixtures() {
+        let mut app = create_test_app();
+        let fixtures = [
+            (
+                "agent_running",
+                "Running",
+                crate::tools::subagent::SubAgentStatus::Running,
+                crate::tools::subagent::AgentWorkerStatus::RunningTool,
+                AgentCurrentActivityStatus::RunningTool,
+                "tool",
+            ),
+            (
+                "agent_waiting",
+                "Waiting",
+                crate::tools::subagent::SubAgentStatus::Interrupted("approval".to_string()),
+                crate::tools::subagent::AgentWorkerStatus::WaitingForUser,
+                AgentCurrentActivityStatus::Waiting,
+                "waiting",
+            ),
+            (
+                "agent_failed",
+                "Failed",
+                crate::tools::subagent::SubAgentStatus::Failed("verification".to_string()),
+                crate::tools::subagent::AgentWorkerStatus::Failed,
+                AgentCurrentActivityStatus::Failed,
+                "failed",
+            ),
+            (
+                "agent_done",
+                "Done",
+                crate::tools::subagent::SubAgentStatus::Completed,
+                crate::tools::subagent::AgentWorkerStatus::Completed,
+                AgentCurrentActivityStatus::Done,
+                "done",
+            ),
+        ];
+        for (id, nickname, status, worker_status, activity_status, _) in &fixtures {
+            let mut agent = cached_agent(id, Some(nickname));
+            agent.status = status.clone();
+            agent.worker_status = Some(*worker_status);
+            app.subagent_cache.push(agent);
+            app.agent_progress_meta.insert(
+                (*id).to_string(),
+                AgentProgressMeta {
+                    current_activity: Some(AgentCurrentActivity::bounded(
+                        *activity_status,
+                        (*id == "agent_waiting").then_some("approval required".to_string()),
+                        (*id == "agent_running").then_some("read_file".to_string()),
+                        Some(2),
+                    )),
+                    ..AgentProgressMeta::default()
+                },
+            );
+        }
+
+        let rows = sidebar_agent_rows(&app);
+        for (id, _, _, _, _, expected_status) in fixtures {
+            let row = rows
+                .iter()
+                .find(|row| row.id == id)
+                .expect("typed lifecycle row");
+            assert_eq!(row.status, expected_status);
+        }
+    }
+
+    #[test]
+    fn sidebar_progress_only_rows_never_infer_status_from_display_text() {
+        let mut app = create_test_app();
+        app.ensure_agent_label("agent_queued");
+        app.agent_progress.insert(
+            "agent_queued".to_string(),
+            "queued waiting failed completed".to_string(),
+        );
+
+        let rows = sidebar_agent_rows(&app);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Agent 1");
+        assert_eq!(rows[0].status, "running");
+
+        app.agent_progress_meta.insert(
+            "agent_queued".to_string(),
+            AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::Queued,
+                    Some("waiting for launch permit".to_string()),
+                    None,
+                    None,
+                )),
+                ..AgentProgressMeta::default()
+            },
+        );
+        crate::tui::ui::record_agent_spawned_route(&mut app, "agent_queued", "deepseek-v4-pro");
+        let rows = sidebar_agent_rows(&app);
+        assert_eq!(rows[0].status, "queued");
+        assert_eq!(rows[0].model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn sidebar_agent_rows_preserve_explicit_names_and_derive_whales_from_locale() {
+        let mut app = create_test_app();
+        let agent_id = "agent_cafe0123";
+        app.ensure_agent_label(agent_id);
+        app.subagent_cache
+            .push(cached_agent(agent_id, Some("doc-fixer")));
+
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(
+            rows[0].name, "doc-fixer",
+            "an explicit custom nickname remains user-owned"
+        );
+
+        // Without an explicit nickname, display is derived from the neutral id
+        // in the active UI locale rather than from the old Agent-N label.
+        app.subagent_cache[0].nickname = None;
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(
+            rows[0].name,
+            crate::tools::subagent::whale_name_for_id_in_locale(agent_id, "en")
         );
     }
 
     #[test]
-    fn navigator_shows_foreground_rlm_work_when_no_subagents_exist() {
-        let summary = SidebarSubagentSummary {
-            foreground_rlm_running: true,
-            ..SidebarSubagentSummary::default()
-        };
-        let text = lines_to_text(&subagent_navigator_lines(&summary, 64));
+    fn sidebar_agent_rows_lead_with_the_dispatch_name() {
+        // #5287: operators dispatch by name and think by name, so the session
+        // name outranks both the generated whale and the Agent-N label.
+        let mut app = create_test_app();
+        let agent_id = "agent_cafe0123";
+        app.ensure_agent_label(agent_id);
+        let mut agent = cached_agent(agent_id, Some("Blue Whale"));
+        agent.name = "branch-triage".to_string();
+        app.subagent_cache.push(agent);
 
-        assert!(!text[0].contains("No agents"), "header: {:?}", text);
-        assert!(
-            text.iter()
-                .any(|line| line.contains("RLM foreground work active")),
-            "RLM work must be visible in Agents panel: {text:?}"
-        );
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(rows[0].name, "branch-triage");
     }
+
+    #[test]
+    fn sidebar_agent_rows_prefer_resolved_profile_over_generated_whale() {
+        let mut app = create_test_app();
+        let agent_id = "agent_cafe0123";
+        app.ensure_agent_label(agent_id);
+        let mut agent = cached_agent(agent_id, Some("Blue Whale"));
+        agent.child_route = Some(crate::tools::subagent::ChildRouteReceipt {
+            requested_type: "custom".to_string(),
+            requested_profile: Some("DeepSeek V4 Flash".to_string()),
+            resolved_profile_id: Some("flash-scout".to_string()),
+            profile_origin: Some("fleet:release".to_string()),
+            canonical_role: "scout".to_string(),
+            provider_id: "deepseek".to_string(),
+            model_id: "deepseek-v4-flash-vision-exp".to_string(),
+            route_source: "fleet".to_string(),
+            requested_reasoning: "inherit".to_string(),
+            effective_reasoning: None,
+            runtime_version: "test".to_string(),
+            runtime_build_sha: "unknown".to_string(),
+        });
+        app.subagent_cache.push(agent);
+
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(rows[0].name, "flash-scout");
+    }
+
+    #[test]
+    fn english_sidebar_relocalizes_mixed_persisted_whale_names() {
+        let mut app = create_test_app();
+        app.ui_locale = Locale::En;
+        for (agent_id, legacy_locale) in [
+            ("agent_locale_a", "zh-Hans"),
+            ("agent_locale_b", "ja"),
+            ("agent_locale_c", "vi"),
+        ] {
+            let legacy_name =
+                crate::tools::subagent::whale_name_for_id_in_locale(agent_id, legacy_locale);
+            app.subagent_cache
+                .push(cached_agent(agent_id, Some(&legacy_name)));
+        }
+
+        let rows = super::sidebar_agent_rows(&app);
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(
+                row.name.is_ascii(),
+                "English Fleet display leaked a prior-locale whale: {}",
+                row.name
+            );
+            assert_eq!(
+                row.name,
+                crate::tools::subagent::whale_name_for_id_in_locale(&row.id, "en")
+            );
+        }
+    }
+
+    // --- Unicode / CJK / terminal-width QA (issue #3488) -------------------
+    // The sub-agent overlay renders CJK display names next to ASCII ids,
+    // numeric columns (step count, elapsed), status verbs, and branch lines.
+    // These guard that a CJK name never shifts the status columns, corrupts the
+    // panel border, or hides the running/completed state (#3488 dogfood case:
+    // a worker named 抹香鲸).
 }

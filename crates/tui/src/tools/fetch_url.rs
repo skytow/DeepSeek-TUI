@@ -7,42 +7,25 @@
 //! (`format = "markdown"`); pass `format = "raw"` to keep the bytes intact
 //! when the model wants to do its own parsing.
 
+use super::handle::query_jsonpath;
+use super::pdf::PdfTextCommand;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, optional_u64,
 };
-use crate::network_policy::{Decision, host_from_url};
+use super::web::extract::{DocumentKind, ExtractedDocument, decode_response_body};
+use super::web::fetch::{
+    DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, FetchOptions, HARD_MAX_BYTES, HARD_MAX_TIMEOUT, fetch,
+};
+use super::web::overflow::bound_text as bound_web_text;
+#[cfg(test)]
+use super::web::overflow::inline_char_budget;
 use async_trait::async_trait;
-use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::OnceLock;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-const DEFAULT_MAX_BYTES: u64 = 1_000_000;
-const HARD_MAX_BYTES: u64 = 10 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS: u64 = 15_000;
-const HARD_MAX_TIMEOUT_MS: u64 = 60_000;
-const MAX_REDIRECTS: usize = 5;
-const USER_AGENT: &str =
-    "Mozilla/5.0 (compatible; deepseek-tui/0.5; +https://github.com/Hmbown/DeepSeek-TUI)";
-
-static SCRIPT_RE: OnceLock<Regex> = OnceLock::new();
-static STYLE_RE: OnceLock<Regex> = OnceLock::new();
-static TAG_RE: OnceLock<Regex> = OnceLock::new();
-static WHITESPACE_RE: OnceLock<Regex> = OnceLock::new();
-
-fn script_re() -> &'static Regex {
-    SCRIPT_RE.get_or_init(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("script re"))
-}
-fn style_re() -> &'static Regex {
-    STYLE_RE.get_or_init(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("style re"))
-}
-fn tag_re() -> &'static Regex {
-    TAG_RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("tag re"))
-}
-fn whitespace_re() -> &'static Regex {
-    WHITESPACE_RE.get_or_init(|| Regex::new(r"\s+").expect("ws re"))
-}
+const FETCH_ACCEPT: &str = "text/html,text/markdown,text/plain,application/json,application/pdf,image/*,audio/*,video/*,*/*;q=0.5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -71,11 +54,34 @@ impl Format {
 
 #[derive(Debug, Serialize)]
 struct FetchResponse {
+    ref_id: String,
     url: String,
     status: u16,
+    headers: BTreeMap<String, String>,
     content_type: String,
     content: String,
     truncated: bool,
+    receipt: FetchReceipt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fields: Option<BTreeMap<String, Vec<Value>>>,
+}
+
+#[derive(Debug, Serialize)]
+struct FetchReceipt {
+    cache_hit: bool,
+    retries: usize,
+    redirects: usize,
+}
+
+#[derive(Debug)]
+struct ArtifactWrite {
+    session_id: String,
+    absolute_path: std::path::PathBuf,
+    relative_path: std::path::PathBuf,
+    byte_size: u64,
+    preview: String,
 }
 
 pub struct FetchUrlTool;
@@ -86,8 +92,12 @@ impl ToolSpec for FetchUrlTool {
         "fetch_url"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
-        "Fetch a known URL directly (HTTP GET) and return its content. Use this when the user gives a URL or you already know the canonical link — it's faster and more reliable than web_search for known pages."
+        "Fetch a known URL directly (HTTP GET) and return its content with a session-scoped citation ref_id. Use this instead of `curl` in `exec_shell` — sandboxed, network-policy aware, and properly decoded. Plain-text endpoints (`.md`, `.txt`, `.json`, `.yaml`, `raw.githubusercontent.com`, public APIs) prefer this over the browser/automation stack. For unknown queries, use `web_search` first. If a login or authorization wall is returned, treat the wall as the result; do not claim the protected page was read."
     }
 
     fn input_schema(&self) -> Value {
@@ -101,7 +111,7 @@ impl ToolSpec for FetchUrlTool {
                 "format": {
                     "type": "string",
                     "enum": ["text", "markdown", "raw"],
-                    "description": "Post-processing for the response body. `markdown` (default) and `text` strip HTML tags to readable text; `raw` returns the body bytes as-is."
+                    "description": "Post-processing for the response body. `markdown` (default) uses readability extraction and real HTML-to-Markdown conversion; `text` returns readable plain text; `raw` preserves textual response bytes. Binary media is saved as a session artifact."
                 },
                 "max_bytes": {
                     "type": "integer",
@@ -110,6 +120,11 @@ impl ToolSpec for FetchUrlTool {
                 "timeout_ms": {
                     "type": "integer",
                     "description": "Request timeout in milliseconds (default 15,000; max 60,000)."
+                },
+                "fields": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional JSONPath projections for JSON responses. Supports $, .field, [index], [*], and ['field']; returns matches under `fields`."
                 }
             },
             "required": ["url"]
@@ -142,221 +157,356 @@ impl ToolSpec for FetchUrlTool {
             ));
         }
 
-        // Extract host once for reuse across network policy + SSRF checks.
-        let url_host = host_from_url(&url);
-
-        // Per-domain network policy gate (#135). If no policy is attached
-        // (e.g. ad-hoc tests), behavior is permissive — match pre-v0.7.0.
-        if let Some(decider) = context.network_policy.as_ref()
-            && let Some(ref host) = url_host
-        {
-            match decider.evaluate(host, "fetch_url") {
-                Decision::Allow => {}
-                Decision::Deny => {
-                    return Err(ToolError::permission_denied(format!(
-                        "network call to '{host}' blocked by network policy"
-                    )));
-                }
-                Decision::Prompt => {
-                    return Err(ToolError::permission_denied(format!(
-                        "network call to '{host}' requires approval; \
-                         re-run after `/network allow {host}` or set network.default = \"allow\" in config"
-                    )));
-                }
-            }
-        }
-
-        // SSRF protection: resolve hostname and reject private/link-local/loopback IPs.
-        // Prevents LLM-prompted requests to cloud metadata (169.254.169.254),
-        // localhost services, and internal networks.
-        // Pin the validated IP via ClientBuilder::resolve() to close the DNS rebinding
-        // TOCTOU window — reqwest will use the pinned IP instead of re-resolving.
-        let mut dns_pinning = None; // (hostname, validated_ip)
-        if let Some(host) = &url_host {
-            if host == "localhost" || host == "localhost.localdomain" {
-                return Err(ToolError::permission_denied(
-                    "requests to localhost are not allowed",
-                ));
-            }
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                if is_restricted_ip(&ip) {
-                    return Err(ToolError::permission_denied(format!(
-                        "IP {ip} is a restricted address (private/loopback/link-local)"
-                    )));
-                }
-            } else if let Ok(addrs) = tokio::net::lookup_host((&**host, 0u16)).await {
-                let mut first_valid: Option<std::net::IpAddr> = None;
-                for addr in addrs {
-                    if is_restricted_ip(&addr.ip()) {
-                        return Err(ToolError::permission_denied(format!(
-                            "resolved IP {} is a restricted address (private/loopback/link-local)",
-                            addr.ip()
-                        )));
-                    }
-                    if first_valid.is_none() {
-                        first_valid = Some(addr.ip());
-                    }
-                }
-                if let Some(validated_ip) = first_valid {
-                    dns_pinning = Some((host.clone(), validated_ip));
-                }
-            }
-            // If DNS resolution fails, let the HTTP request proceed and fail naturally.
-        }
-
         let format = Format::parse(input.get("format").and_then(Value::as_str))?;
-        let max_bytes = optional_u64(&input, "max_bytes", DEFAULT_MAX_BYTES).min(HARD_MAX_BYTES);
-        let timeout_ms =
-            optional_u64(&input, "timeout_ms", DEFAULT_TIMEOUT_MS).min(HARD_MAX_TIMEOUT_MS);
-
-        let mut client_builder = reqwest::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS));
-
-        // Pin validated IP to prevent DNS rebinding (TOCTOU) — reqwest will
-        // connect to the validated IP directly instead of re-resolving.
-        if let Some((hostname, validated_ip)) = dns_pinning {
-            client_builder =
-                client_builder.resolve(&hostname, std::net::SocketAddr::new(validated_ip, 0));
-        }
-
-        let client = client_builder.build().map_err(|e| {
-            ToolError::execution_failed(format!("failed to build HTTP client: {e}"))
-        })?;
-
-        let resp = client
-            .get(&url)
-            .header("Accept", "text/html,text/plain,application/json,*/*;q=0.5")
-            .header("Accept-Language", "en-US,en;q=0.5")
-            .send()
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("request failed: {e}")))?;
-
-        let final_url = resp.url().to_string();
-        let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("failed to read body: {e}")))?;
-        let total_bytes = bytes.len() as u64;
-        let truncated = total_bytes > max_bytes;
-        let usable = if truncated {
-            &bytes[..max_bytes as usize]
+        let max_bytes =
+            usize::try_from(optional_u64(&input, "max_bytes", DEFAULT_MAX_BYTES as u64)?)
+                .unwrap_or(HARD_MAX_BYTES)
+                .clamp(1, HARD_MAX_BYTES);
+        let timeout_ms = optional_u64(&input, "timeout_ms", DEFAULT_TIMEOUT.as_millis() as u64)?
+            .clamp(1, HARD_MAX_TIMEOUT.as_millis() as u64);
+        let requested_fields = parse_fields(&input)?;
+        let fetched = fetch(
+            &url,
+            &FetchOptions::new(Duration::from_millis(timeout_ms), max_bytes, FETCH_ACCEPT),
+            context,
+            "fetch_url",
+        )
+        .await?;
+        let is_success = (200..300).contains(&fetched.status);
+        let body_text = if requested_fields.is_empty() {
+            None
         } else {
-            &bytes[..]
+            // JSON is never allowed to discover an encoding from body markup.
+            Some(decode_response_body(
+                &fetched.bytes,
+                Some(&fetched.content_type),
+                false,
+            )?)
         };
-
-        let body_text = String::from_utf8_lossy(usable).to_string();
-        let processed = match format {
-            Format::Raw => body_text,
-            Format::Text | Format::Markdown => {
-                if content_type.contains("text/html") || body_text.contains("<html") {
-                    html_to_text(&body_text)
-                } else {
-                    body_text
-                }
-            }
+        let fields = match body_text.as_deref() {
+            Some(body) => project_json_fields(body, &fetched.content_type, &requested_fields)?,
+            None => None,
         };
+        let extracted = extract_fetched_document(
+            format,
+            &fetched.url,
+            &fetched.content_type,
+            &fetched.bytes,
+            is_success,
+            body_text.as_deref(),
+            PdfTextCommand::system(context.cancel_token.as_ref()),
+        )
+        .await?;
 
+        let citation_title = extracted.title.clone();
+        let (processed, artifact_write) = render_extracted(
+            &fetched.url,
+            &fetched.content_type,
+            format,
+            extracted,
+            &fetched.bytes,
+            context,
+        )?;
+        let artifact = artifact_write
+            .as_ref()
+            .map(|write| crate::artifacts::format_artifact_relative_path(&write.relative_path));
+
+        let citation = super::web::citations::register(
+            &context.state_namespace,
+            &fetched.url,
+            citation_title.as_deref(),
+        )
+        .ok_or_else(|| ToolError::execution_failed("fetched URL could not be registered"))?;
         let response = FetchResponse {
-            url: final_url,
-            status: status.as_u16(),
-            content_type,
+            ref_id: citation.ref_id,
+            url: citation.url,
+            status: fetched.status,
+            headers: fetched.headers,
+            content_type: fetched.content_type,
             content: processed,
-            truncated,
+            truncated: fetched.truncated,
+            receipt: FetchReceipt {
+                cache_hit: fetched.cache_hit,
+                retries: fetched.retries,
+                redirects: fetched.redirects,
+            },
+            artifact,
+            fields,
         };
 
-        if !status.is_success() {
+        let content = serde_json::to_string_pretty(&response).map_err(|error| {
+            ToolError::execution_failed(format!("failed to serialize response: {error}"))
+        })?;
+        let metadata = artifact_write.map(artifact_metadata);
+
+        if !is_success {
             // Don't `Err` on 4xx/5xx — the caller often wants to see the body
             // (e.g. a JSON error envelope). Mark the result as a failure so the
             // engine renders it as such.
             return Ok(ToolResult {
-                content: serde_json::to_string_pretty(&response).map_err(|e| {
-                    ToolError::execution_failed(format!("failed to serialize response: {e}"))
-                })?,
+                content,
                 success: false,
-                metadata: None,
+                metadata,
             });
         }
 
-        ToolResult::json(&response)
-            .map_err(|e| ToolError::execution_failed(format!("failed to serialize response: {e}")))
+        Ok(ToolResult {
+            content,
+            success: true,
+            metadata,
+        })
     }
 }
 
-/// Check if an IP address is loopback, private, link-local, cloud-metadata,
-/// multicast, or reserved — all addresses that should not be reachable via
-/// an LLM-initiated fetch_url request (SSRF prevention).
-fn is_restricted_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                // 100.64.0.0/10 — Carrier-grade NAT (CGNAT / shared address space)
-                || matches!(v4.octets(), [100, 64..=127, ..])
-                // 169.254.169.254 — cloud metadata (AWS/GCP/Azure)
-                || *ip == std::net::IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254))
-                // 198.18.0.0/15 — IETF benchmark testing
-                || matches!(v4.octets(), [198, 18..=19, ..])
-                // 240.0.0.0/4 — reserved (former Class E)
-                || v4.octets()[0] >= 240
+async fn extract_fetched_document(
+    format: Format,
+    url: &str,
+    content_type: &str,
+    bytes: &[u8],
+    is_success: bool,
+    decoded_body: Option<&str>,
+    pdf_command: PdfTextCommand<'_>,
+) -> Result<ExtractedDocument, ToolError> {
+    let extraction = if format == Format::Raw
+        && super::web::extract::validate_pdf_response(url, Some(content_type), bytes)?
+    {
+        Ok(ExtractedDocument {
+            kind: DocumentKind::Pdf,
+            title: Some("PDF Document".to_string()),
+            text: String::new(),
+            markdown: String::new(),
+            cleaned_html: None,
+            pdf_pages: None,
+            media_extension: None,
+        })
+    } else {
+        super::web::extract::extract_document_with_pdf_command(
+            url,
+            Some(content_type),
+            bytes,
+            pdf_command,
+        )
+        .await
+    };
+    match extraction {
+        Ok(document) => Ok(document),
+        Err(_error)
+            if (format == Format::Raw || !is_success) && is_declared_textual(content_type) =>
+        {
+            let body_text = match decoded_body {
+                Some(body_text) => body_text.to_string(),
+                None => {
+                    decode_response_body(bytes, Some(content_type), is_declared_html(content_type))?
+                }
+            };
+            Ok(ExtractedDocument {
+                kind: DocumentKind::Text,
+                title: None,
+                text: body_text.clone(),
+                markdown: body_text,
+                cleaned_html: None,
+                pdf_pages: None,
+                media_extension: None,
+            })
         }
-        std::net::IpAddr::V6(v6) => {
-            // IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) — unwrap and check as IPv4
-            // to prevent bypass via ::ffff:127.0.0.1 etc.
-            if v6.is_unspecified()
-                || matches!(v6.octets(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ..])
-            {
-                return true;
-            }
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_restricted_ip(&std::net::IpAddr::V4(v4));
-            }
-            v6.is_loopback()
-                || v6.is_multicast()
-                || matches!(v6.segments(), [0xfc00..=0xfdff, ..]) // ULA fc00::/7
-                || matches!(v6.segments(), [0xfe80..=0xfebf, ..]) // Link-local fe80::/10
-        }
+        Err(error) => Err(error),
     }
 }
 
-/// Strip `<script>` / `<style>` blocks, drop remaining tags, and collapse
-/// whitespace. Good enough for "let the model read this page" — not a full
-/// HTML-to-Markdown converter.
-fn html_to_text(html: &str) -> String {
-    let no_script = script_re().replace_all(html, "");
-    let no_style = style_re().replace_all(&no_script, "");
-    let no_tags = tag_re().replace_all(&no_style, " ");
-    let decoded = decode_entities(&no_tags);
-    whitespace_re()
-        .replace_all(&decoded, " ")
+fn is_declared_textual(content_type: &str) -> bool {
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
         .trim()
-        .to_string()
+        .to_ascii_lowercase();
+    content_type.starts_with("text/")
+        || content_type.contains("html")
+        || content_type.contains("json")
+        || content_type.contains("xml")
+        || content_type.contains("yaml")
+        || content_type.contains("javascript")
 }
 
-/// Decode the handful of HTML entities we expect to hit in stripped text.
-/// Pulling in `html-escape` for the long tail isn't worth the dep weight.
-fn decode_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
+fn is_declared_html(content_type: &str) -> bool {
+    matches!(
+        content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "text/html" | "application/xhtml+xml"
+    )
 }
+
+fn render_extracted(
+    url: &str,
+    content_type: &str,
+    format: Format,
+    document: ExtractedDocument,
+    bytes: &[u8],
+    context: &ToolContext,
+) -> Result<(String, Option<ArtifactWrite>), ToolError> {
+    if document.kind == DocumentKind::Pdf && format != Format::Raw {
+        let extracted = match format {
+            Format::Text => document.text,
+            Format::Markdown => document.markdown,
+            Format::Raw => unreachable!("raw PDF handled below"),
+        };
+        return bound_text(url, extracted, context);
+    }
+
+    if document.kind == DocumentKind::Media || document.kind == DocumentKind::Pdf {
+        let extension = document
+            .media_extension
+            .unwrap_or(if document.kind == DocumentKind::Pdf {
+                "pdf"
+            } else {
+                "bin"
+            });
+        let artifact = write_binary_artifact(url, extension, bytes, context)?;
+        let relative = crate::artifacts::format_artifact_relative_path(&artifact.relative_path);
+        let label = if document.kind == DocumentKind::Pdf {
+            "PDF"
+        } else {
+            "media"
+        };
+        let content =
+            format!("[{label} response saved to {relative}; content type: {content_type}.]");
+        return Ok((content, Some(artifact)));
+    }
+
+    let content = match format {
+        Format::Raw => decode_response_body(
+            bytes,
+            Some(content_type),
+            document.kind == DocumentKind::Html,
+        )?,
+        Format::Text => document.text,
+        Format::Markdown => document.markdown,
+    };
+    bound_text(url, content, context)
+}
+
+fn bound_text(
+    url: &str,
+    content: String,
+    context: &ToolContext,
+) -> Result<(String, Option<ArtifactWrite>), ToolError> {
+    let bounded = bound_web_text(
+        content,
+        context,
+        |body| fetch_artifact_id(url, body.as_bytes()),
+        "page",
+    )?;
+    let artifact = bounded.artifact.map(|artifact| ArtifactWrite {
+        session_id: artifact.session_id,
+        absolute_path: artifact.absolute_path,
+        relative_path: artifact.relative_path,
+        byte_size: artifact.byte_size,
+        preview: artifact.preview,
+    });
+    Ok((bounded.content, artifact))
+}
+
+fn write_binary_artifact(
+    url: &str,
+    extension: &str,
+    bytes: &[u8],
+    context: &ToolContext,
+) -> Result<ArtifactWrite, ToolError> {
+    let artifact_id = fetch_artifact_id(url, bytes);
+    let (absolute_path, relative_path) = crate::artifacts::write_session_artifact_bytes(
+        &context.state_namespace,
+        &artifact_id,
+        extension,
+        bytes,
+    )
+    .map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to preserve fetched media artifact: {error}"
+        ))
+    })?;
+    Ok(ArtifactWrite {
+        session_id: context.state_namespace.clone(),
+        absolute_path,
+        relative_path,
+        byte_size: bytes.len() as u64,
+        preview: format!("Fetched {extension} artifact from {url}"),
+    })
+}
+
+fn fetch_artifact_id(url: &str, bytes: &[u8]) -> String {
+    let mut identity = Vec::with_capacity(url.len() + bytes.len());
+    identity.extend_from_slice(url.as_bytes());
+    identity.extend_from_slice(bytes);
+    let digest = crate::hashing::sha256_hex(&identity);
+    format!("fetch_{}", &digest[..16])
+}
+
+fn artifact_metadata(write: ArtifactWrite) -> Value {
+    json!({
+        "spillover_path": write.absolute_path.display().to_string(),
+        "artifact_session_id": write.session_id,
+        "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&write.relative_path),
+        "artifact_byte_size": write.byte_size,
+        "artifact_preview": write.preview,
+    })
+}
+
+fn parse_fields(input: &Value) -> Result<Vec<String>, ToolError> {
+    let Some(values) = input.get("fields") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = values.as_array() else {
+        return Err(ToolError::invalid_input("`fields` must be an array"));
+    };
+    let mut fields = Vec::new();
+    for value in values {
+        let Some(field) = value.as_str() else {
+            return Err(ToolError::invalid_input(
+                "`fields` entries must be JSONPath strings",
+            ));
+        };
+        let field = field.trim();
+        if !field.is_empty() {
+            fields.push(field.to_string());
+        }
+    }
+    Ok(fields)
+}
+
+fn project_json_fields(
+    body_text: &str,
+    content_type: &str,
+    fields: &[String],
+) -> Result<Option<BTreeMap<String, Vec<Value>>>, ToolError> {
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    if !content_type.to_ascii_lowercase().contains("json") {
+        return Err(ToolError::invalid_input(
+            "`fields` can only be used with JSON responses",
+        ));
+    }
+    let body_json: Value = serde_json::from_str(body_text).map_err(|e| {
+        ToolError::execution_failed(format!("response body is not valid JSON for `fields`: {e}"))
+    })?;
+    let mut out = BTreeMap::new();
+    for field in fields {
+        let matches = query_jsonpath(&body_json, field).map_err(|e| {
+            ToolError::invalid_input(format!("invalid JSONPath `{field}` in `fields`: {e}"))
+        })?;
+        out.insert(field.clone(), matches);
+    }
+    Ok(Some(out))
+}
+
+#[cfg(test)]
+#[path = "fetch_url/tests.rs"]
+mod pdf_tests;
 
 #[cfg(test)]
 mod tests {
@@ -364,29 +514,16 @@ mod tests {
     use crate::tools::spec::ToolContext;
     use std::path::PathBuf;
 
-    fn ctx() -> ToolContext {
-        ToolContext::new(PathBuf::from("."))
+    struct ArtifactRootRestore(Option<PathBuf>);
+
+    impl Drop for ArtifactRootRestore {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
     }
 
-    #[test]
-    fn html_to_text_strips_scripts_styles_and_tags() {
-        let html = r#"
-            <html>
-              <head>
-                <style>body { color: red; }</style>
-                <script>alert("nope");</script>
-              </head>
-              <body>
-                <h1>Hello &amp; welcome</h1>
-                <p>This is <b>important</b>.</p>
-              </body>
-            </html>
-        "#;
-        let text = html_to_text(html);
-        assert!(text.contains("Hello & welcome"));
-        assert!(text.contains("This is important"));
-        assert!(!text.contains("alert"));
-        assert!(!text.contains("color: red"));
+    fn ctx() -> ToolContext {
+        ToolContext::new(PathBuf::from("."))
     }
 
     #[test]
@@ -397,6 +534,101 @@ mod tests {
         assert_eq!(Format::parse(Some("raw")).unwrap(), Format::Raw);
         assert_eq!(Format::parse(None).unwrap(), Format::Markdown);
         assert!(Format::parse(Some("yaml")).is_err());
+    }
+
+    #[test]
+    fn raw_text_uses_declared_charset_and_rejects_nul_binary() {
+        let document = || ExtractedDocument {
+            kind: DocumentKind::Text,
+            title: None,
+            text: String::new(),
+            markdown: String::new(),
+            cleaned_html: None,
+            pdf_pages: None,
+            media_extension: None,
+        };
+        let (bytes, _, _) = encoding_rs::WINDOWS_1252.encode("café");
+        let (content, artifact) = render_extracted(
+            "https://example.com/plain",
+            "text/plain; charset=windows-1252",
+            Format::Raw,
+            document(),
+            &bytes,
+            &ctx(),
+        )
+        .expect("decode raw text");
+        assert_eq!(content, "café");
+        assert!(artifact.is_none());
+
+        let error = render_extracted(
+            "https://example.com/not-text",
+            "text/plain",
+            Format::Raw,
+            document(),
+            b"binary\0payload",
+            &ctx(),
+        )
+        .expect_err("raw text must retain the binary guard");
+        assert!(error.to_string().contains("NUL bytes"));
+    }
+
+    #[test]
+    fn textual_and_html_fallback_classification_is_exact() {
+        assert!(is_declared_textual("Application/JSON; charset=utf-8"));
+        assert!(is_declared_html("TEXT/HTML; charset=gbk"));
+        assert!(!is_declared_html("text/plain; note=text/html"));
+        assert!(!is_declared_textual("application/octet-stream"));
+    }
+
+    #[test]
+    fn route_budget_overflow_round_trips_through_session_artifact() {
+        let _lock = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prior =
+            crate::artifacts::set_test_artifact_sessions_root(Some(tmp.path().join("sessions")));
+        let _restore = ArtifactRootRestore(prior);
+        let context = ToolContext::new(".")
+            .with_state_namespace("fetch-overflow")
+            .with_route_context_window(10_000);
+        let full = "Whale content. ".repeat(200);
+
+        let (inline, artifact) =
+            bound_text("https://example.com/large", full.clone(), &context).unwrap();
+        let artifact = artifact.expect("overflow artifact");
+
+        assert!(inline.contains("retrieve_tool_result"));
+        assert!(inline.chars().count() <= inline_char_budget(&context));
+        assert_eq!(
+            std::fs::read_to_string(artifact.absolute_path).unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn project_json_fields_returns_requested_jsonpath_matches() {
+        let fields = vec!["$.items[*].name".to_string(), "$.count".to_string()];
+        let projected = project_json_fields(
+            r#"{"items":[{"name":"alpha"},{"name":"beta"}],"count":2}"#,
+            "application/json",
+            &fields,
+        )
+        .expect("project")
+        .expect("some");
+
+        assert_eq!(
+            projected.get("$.items[*].name").unwrap(),
+            &vec![json!("alpha"), json!("beta")]
+        );
+        assert_eq!(projected.get("$.count").unwrap(), &vec![json!(2)]);
+    }
+
+    #[test]
+    fn project_json_fields_rejects_non_json_content_type() {
+        let fields = vec!["$.name".to_string()];
+        let err = project_json_fields("{}", "text/plain", &fields).expect_err("must reject");
+        assert!(format!("{err}").contains("JSON responses"));
     }
 
     #[tokio::test]
@@ -423,61 +655,6 @@ mod tests {
         assert!(res.is_err());
     }
 
-    #[test]
-    fn rejects_private_localhost_literal() {
-        assert!(is_restricted_ip(&"127.0.0.1".parse().unwrap()));
-        assert!(is_restricted_ip(&"::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_private_rfc1918() {
-        assert!(is_restricted_ip(&"10.0.0.1".parse().unwrap()));
-        assert!(is_restricted_ip(&"172.16.0.1".parse().unwrap()));
-        assert!(is_restricted_ip(&"192.168.1.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_cloud_metadata() {
-        assert!(is_restricted_ip(&"169.254.169.254".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_link_local() {
-        assert!(is_restricted_ip(&"169.254.1.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_cgnat() {
-        assert!(is_restricted_ip(&"100.64.0.1".parse().unwrap()));
-        assert!(!is_restricted_ip(&"100.63.0.1".parse().unwrap()));
-        assert!(!is_restricted_ip(&"100.128.0.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_ipv6_ula() {
-        assert!(is_restricted_ip(&"fc00::1".parse().unwrap()));
-        assert!(is_restricted_ip(&"fd12:3456::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn rejects_ipv4_mapped_ipv6() {
-        // ::ffff:127.0.0.1 — IPv4-mapped IPv6 loopback bypass
-        assert!(is_restricted_ip(&"::ffff:127.0.0.1".parse().unwrap()));
-        assert!(is_restricted_ip(&"::ffff:10.0.0.1".parse().unwrap()));
-        assert!(is_restricted_ip(&"::ffff:169.254.169.254".parse().unwrap()));
-        assert!(is_restricted_ip(&"::ffff:192.168.1.1".parse().unwrap()));
-        // :: (unspecified)
-        assert!(is_restricted_ip(&"::".parse().unwrap()));
-    }
-
-    #[test]
-    fn allows_public_ips() {
-        assert!(!is_restricted_ip(&"8.8.8.8".parse().unwrap()));
-        assert!(!is_restricted_ip(&"1.1.1.1".parse().unwrap()));
-        assert!(!is_restricted_ip(&"93.184.216.34".parse().unwrap()));
-        assert!(!is_restricted_ip(&"2606:4700::1".parse().unwrap()));
-    }
-
     #[tokio::test]
     async fn rejects_localhost_hostname() {
         let tool = FetchUrlTool;
@@ -495,6 +672,8 @@ mod tests {
             default: Decision::Deny.into(),
             allow: vec!["api.deepseek.com".to_string()],
             deny: vec![],
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
             audit: false,
         };
         let decider = NetworkPolicyDecider::new(policy, None);
@@ -505,5 +684,29 @@ mod tests {
             .await;
         let err = res.expect_err("blocked host should fail");
         assert!(format!("{err}").contains("blocked"));
+    }
+
+    #[tokio::test]
+    async fn proxy_opt_in_does_not_allow_restricted_ip_literal() {
+        use crate::network_policy::{Decision, NetworkPolicy, NetworkPolicyDecider};
+
+        let policy = NetworkPolicy {
+            default: Decision::Allow.into(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            proxy: vec!["198.18.0.1".to_string()],
+            proxy_fake_ip_cidrs: vec!["198.18.0.0/15".to_string()],
+            audit: false,
+        };
+        let decider = NetworkPolicyDecider::new(policy, None);
+        let ctx = ToolContext::new(PathBuf::from(".")).with_network_policy(decider);
+        let tool = FetchUrlTool;
+
+        let err = tool
+            .execute(json!({"url": "http://198.18.0.1/status"}), &ctx)
+            .await
+            .expect_err("literal restricted IP URLs must stay blocked");
+
+        assert!(format!("{err}").contains("IP 198.18.0.1 is a restricted address"));
     }
 }

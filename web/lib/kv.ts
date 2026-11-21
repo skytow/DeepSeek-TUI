@@ -6,7 +6,7 @@ import type { CuratedDispatch } from "./types";
 
 const MEM = new Map<string, string>();
 
-interface KVNamespace {
+export interface KVNamespace {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
   list(opts?: { prefix?: string; limit?: number }): Promise<{ keys: { name: string }[] }>;
@@ -16,23 +16,35 @@ interface KVNamespace {
 interface CloudflareEnv {
   CURATED_KV?: KVNamespace;
   DEEPSEEK_API_KEY?: string;
+  DEEPSEEK_BASE_URL?: string;
+  DEEPSEEK_MODEL?: string;
   GITHUB_TOKEN?: string;
   CRON_SECRET?: string;
   GITHUB_REPO?: string;
 }
 
+function envFromProcess(): CloudflareEnv {
+  return {
+    DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
+    DEEPSEEK_BASE_URL: process.env.DEEPSEEK_BASE_URL,
+    DEEPSEEK_MODEL: process.env.DEEPSEEK_MODEL,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    CRON_SECRET: process.env.CRON_SECRET,
+    GITHUB_REPO: process.env.GITHUB_REPO,
+  };
+}
+
 export async function getEnv(): Promise<CloudflareEnv> {
+  if (process.env.NEXT_PHASE === "phase-production-build") {
+    return envFromProcess();
+  }
+
   try {
     const mod = await import("@opennextjs/cloudflare");
     const ctx = await mod.getCloudflareContext({ async: true });
     return ctx.env as CloudflareEnv;
   } catch {
-    return {
-      DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
-      GITHUB_TOKEN: process.env.GITHUB_TOKEN,
-      CRON_SECRET: process.env.CRON_SECRET,
-      GITHUB_REPO: process.env.GITHUB_REPO,
-    };
+    return envFromProcess();
   }
 }
 
@@ -49,9 +61,13 @@ export async function getDispatch(): Promise<CuratedDispatch | null> {
 
 export async function putDispatch(d: CuratedDispatch): Promise<void> {
   const env = await getEnv();
+  await putDispatchWithKv(env.CURATED_KV, d);
+}
+
+export async function putDispatchWithKv(kv: KVNamespace | undefined, d: CuratedDispatch): Promise<void> {
   const value = JSON.stringify(d);
-  if (env.CURATED_KV) {
-    await env.CURATED_KV.put("dispatch:latest", value, { expirationTtl: 60 * 60 * 24 * 7 });
+  if (kv) {
+    await kv.put("dispatch:latest", value, { expirationTtl: 60 * 60 * 24 * 7 });
   } else {
     MEM.set("dispatch:latest", value);
   }

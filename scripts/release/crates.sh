@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 
-# Crates published for each DeepSeek TUI release, in dependency order.
+# Crates published for each codewhale release, in dependency order.
 release_crates=(
-  deepseek-secrets
-  deepseek-config
-  deepseek-protocol
-  deepseek-state
-  deepseek-agent
-  deepseek-execpolicy
-  deepseek-hooks
-  deepseek-mcp
-  deepseek-tools
-  deepseek-core
-  deepseek-app-server
-  deepseek-tui-core
-  deepseek-tui-cli
-  deepseek-tui
+  codewhale-build-support
+  codewhale-mcp
+  codewhale-paths
+  codewhale-protocol
+  codewhale-release
+  codewhale-secrets
+  codewhale-state
+  codewhale-workflow
+  codewhale-workflow-js
+  codewhale-execpolicy
+  codewhale-hooks
+  codewhale-tools
+  codewhale-config
+  # Path+version dependency of cli/tui — must publish before those crates.
+  codewhale-telemetry
+  codewhale-lane
+  codewhale-agent
+  codewhale-core
+  # Prototype command boundary depends on core; future TUI/commands adapters
+  # consume it without changing current production dispatch in FEAT-014.
+  codewhale-command-contract
+  codewhale-tui
+  codewhale-app-server
+  codewhale-cli
 )

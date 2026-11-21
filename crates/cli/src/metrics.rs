@@ -1,4 +1,4 @@
-//! `deepseek metrics` — reads the audit log and session/task stores and prints
+//! `codewhale metrics` — reads the audit log and session/task stores and prints
 //! a human-readable usage rollup.
 //!
 //! Data sources:
@@ -17,7 +17,7 @@ use serde_json::Value;
 // Public entry-point
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Arguments accepted by `deepseek metrics`.
+/// Arguments accepted by `codewhale metrics`.
 #[derive(Debug, Default)]
 pub struct MetricsArgs {
     /// Emit machine-readable JSON instead of human text.
@@ -77,7 +77,7 @@ fn parse_duration_secs(s: &str) -> Result<i64> {
             'd' | 'h' | 'm' | 's' => {
                 let n: i64 = num_buf
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid duration component: {:?}", num_buf))?;
+                    .map_err(|_| anyhow::anyhow!("invalid duration component: {num_buf:?}"))?;
                 num_buf.clear();
                 let factor = match ch {
                     'd' => 86_400,
@@ -88,7 +88,7 @@ fn parse_duration_secs(s: &str) -> Result<i64> {
                 };
                 total += n * factor;
             }
-            _ => anyhow::bail!("unrecognised character {:?} in duration {:?}", ch, s),
+            _ => anyhow::bail!("unrecognised character {ch:?} in duration {s:?}"),
         }
     }
 
@@ -99,7 +99,7 @@ fn parse_duration_secs(s: &str) -> Result<i64> {
     }
 
     if total == 0 {
-        anyhow::bail!("duration {:?} resolved to zero seconds", s);
+        anyhow::bail!("duration {s:?} resolved to zero seconds");
     }
 
     Ok(total)
@@ -796,7 +796,7 @@ fn print_human(rollup: &Rollup) {
             let mut cats: Vec<(&String, &u64)> = rollup.capacity.by_category.iter().collect();
             cats.sort_by(|a, b| b.1.cmp(a.1));
             cats.iter()
-                .map(|(k, v)| format!("{} {}", v, k))
+                .map(|(k, v)| format!("{v} {k}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -823,15 +823,15 @@ fn print_human(rollup: &Rollup) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn deepseek_home() -> PathBuf {
-    // Respect DEEPSEEK_HOME env override; fall back to ~/.deepseek.
-    if let Ok(v) = std::env::var("DEEPSEEK_HOME")
-        && !v.is_empty()
-    {
-        return PathBuf::from(v);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".deepseek")
+    // This reader preserves the legacy DEEPSEEK_HOME/default-root precedence,
+    // but delegates every environment and platform-home decision to the shared
+    // runtime path authority.
+    codewhale_paths::codewhale_home_override()
+        .ok()
+        .flatten()
+        .or_else(codewhale_paths::legacy_deepseek_home_override)
+        .or_else(codewhale_paths::legacy_deepseek_home)
+        .unwrap_or_else(|| PathBuf::from(codewhale_paths::LEGACY_APP_DIR))
 }
 
 /// Parse a timestamp from a JSON value field (tries RFC3339).

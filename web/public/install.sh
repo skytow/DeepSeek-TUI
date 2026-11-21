@@ -1,0 +1,341 @@
+#!/bin/sh
+set -eu
+
+repo="Hmbown/CodeWhale"
+version="${CODEWHALE_VERSION:-latest}"
+release_base="${CODEWHALE_RELEASE_BASE_URL:-${DEEPSEEK_TUI_RELEASE_BASE_URL:-}}"
+
+usage() {
+  cat <<'USAGE'
+Codewhale GitHub release installer for new macOS and Linux installations.
+For an existing direct install, run its codewhale update command.
+
+Usage:
+  curl -fsSL https://codewhale.net/install.sh | sh
+
+Environment:
+  CODEWHALE_INSTALL_DIR    Install directory. Default: $HOME/.local/bin
+  CODEWHALE_VERSION        Release tag for a fresh directory. Default: latest
+  CODEWHALE_RELEASE_BASE_URL
+                           Custom release asset base URL ending in /download
+  CODEWHALE_SKIP_GLIBC_CHECK=1
+                           Skip Linux arm64 glibc compatibility preflight
+
+Examples:
+  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR="$HOME/.local/codewhale/bin" sh
+  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_VERSION=vX.Y.Z sh
+USAGE
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+say() {
+  printf '%s\n' "$*"
+}
+
+fail() {
+  printf 'codewhale install: %s\n' "$*" >&2
+  exit 1
+}
+
+if [ -n "${CODEWHALE_INSTALL_DIR:-}" ]; then
+  install_dir="$CODEWHALE_INSTALL_DIR"
+else
+  [ -n "${HOME:-}" ] || fail "HOME is not set; set CODEWHALE_INSTALL_DIR"
+  install_dir="$HOME/.local/bin"
+fi
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+download() {
+  url="$1"
+  out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$out"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O "$out"
+  else
+    fail "curl or wget is required"
+  fi
+}
+
+sha256_file() {
+  file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    fail "sha256sum or shasum is required to verify downloads"
+  fi
+}
+
+verify_asset() {
+  asset="$1"
+  file="$2"
+  manifest="$3"
+  expected="$(
+    awk -v name="$asset" '
+      {
+        digest = tolower($1)
+        file = $2
+        sub(/^\*/, "", file)
+        if (file == name && digest ~ /^[0-9a-f]{64}$/) {
+          print digest
+          exit
+        }
+      }
+    ' "$manifest"
+  )"
+  [ -n "$expected" ] || fail "checksum not found for $asset"
+  actual="$(sha256_file "$file" | tr '[:upper:]' '[:lower:]')"
+  [ "$actual" = "$expected" ] || fail "checksum mismatch for $asset"
+}
+
+glibc_version() {
+  if command -v getconf >/dev/null 2>&1; then
+    getconf GNU_LIBC_VERSION 2>/dev/null | awk '{ print $NF; exit }'
+    return
+  fi
+  if command -v ldd >/dev/null 2>&1; then
+    ldd --version 2>/dev/null | awk 'NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+\.[0-9]+/) {
+          print $i
+          exit
+        }
+      }
+    }'
+  fi
+}
+
+version_at_least() {
+  have="$1"
+  need="$2"
+  awk -v have="$have" -v need="$need" '
+    BEGIN {
+      split(have, h, ".")
+      split(need, n, ".")
+      for (i = 1; i <= 3; i++) {
+        hv = h[i] + 0
+        nv = n[i] + 0
+        if (hv > nv) exit 0
+        if (hv < nv) exit 1
+      }
+      exit 0
+    }
+  '
+}
+
+check_glibc() {
+  case "$target" in
+    linux-arm64) ;;
+    *) return ;;
+  esac
+
+  # Linux arm64 assets became static musl builds in v0.9.6. `latest` and
+  # explicit v0.9.6+ installs therefore have no glibc floor. Keep the
+  # preflight only for explicitly requested older releases, whose arm64
+  # assets were linked against GNU libc on Ubuntu 24.04.
+  if [ "$version" = "latest" ]; then
+    return
+  fi
+  numeric_version="${version#v}"
+  if awk -v have="$numeric_version" '
+    BEGIN {
+      if (have !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) exit 1
+      split(have, h, ".")
+      if (h[1] > 0) exit 0
+      if (h[1] < 0) exit 1
+      if (h[2] > 9) exit 0
+      if (h[2] < 9) exit 1
+      exit !(h[3] >= 6)
+    }
+  '; then
+    return
+  fi
+
+  [ "${CODEWHALE_SKIP_GLIBC_CHECK:-}" = "1" ] && return
+  [ "${DEEPSEEK_TUI_SKIP_GLIBC_CHECK:-}" = "1" ] && return
+  [ "${DEEPSEEK_SKIP_GLIBC_CHECK:-}" = "1" ] && return
+
+  required="2.39"
+  host="$(glibc_version || true)"
+  if [ -z "$host" ] || ! version_at_least "$host" "$required"; then
+    cat >&2 <<EOF
+codewhale install: Codewhale $version $target assets require glibc $required or newer.
+This system reports glibc ${host:-unavailable}.
+
+Linux arm64 assets before v0.9.6 were GNU libc builds from Ubuntu 24.04.
+Current v0.9.6+ assets are static musl builds. Build this older release from
+source with Cargo or set
+CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this check at your own risk.
+EOF
+    exit 1
+  fi
+}
+
+detect_platform() {
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Android" ]; then
+    fail "Android/Termux needs the Android arm64 preview archive, not a Linux binary. See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md"
+  fi
+
+  case "$os" in
+    Darwin) platform="macos" ;;
+    Linux) platform="linux" ;;
+    *) fail "unsupported OS: $os. Use the matching asset at https://github.com/Hmbown/CodeWhale/releases/latest; npm and Cargo are secondary options." ;;
+  esac
+
+  case "$arch" in
+    x86_64|amd64) cpu="x64" ;;
+    arm64|aarch64) cpu="arm64" ;;
+    riscv64) fail "Linux riscv64 prebuilt assets are temporarily unavailable because the locked rquickjs-sys dependency does not ship riscv64gc bindings." ;;
+    *) fail "unsupported CPU architecture: $arch. Use Cargo or build from source." ;;
+  esac
+
+  printf '%s-%s' "$platform" "$cpu"
+}
+
+if [ -z "$release_base" ]; then
+  if [ "$version" = "latest" ]; then
+    release_base="https://github.com/$repo/releases/latest/download"
+  else
+    release_base="https://github.com/$repo/releases/download/$version"
+  fi
+fi
+
+target="$(detect_platform)"
+check_glibc
+cli_asset="codewhale-$target"
+shim_asset="codew-$target"
+manifest_asset="codewhale-artifacts-sha256.txt"
+
+tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t codewhale-install)"
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+say "Installing Codewhale for $target"
+say "Release assets: $release_base"
+say "Install dir: $install_dir"
+
+download "$release_base/$manifest_asset" "$tmpdir/$manifest_asset"
+download "$release_base/$cli_asset" "$tmpdir/codewhale"
+download "$release_base/$shim_asset" "$tmpdir/codew"
+
+verify_asset "$cli_asset" "$tmpdir/codewhale" "$tmpdir/$manifest_asset"
+verify_asset "$shim_asset" "$tmpdir/codew" "$tmpdir/$manifest_asset"
+say "Checksums verified"
+
+chmod 755 "$tmpdir/codewhale" "$tmpdir/codew"
+if command -v xattr >/dev/null 2>&1; then
+  xattr -d com.apple.quarantine "$tmpdir/codewhale" "$tmpdir/codew" 2>/dev/null || true
+fi
+
+# Resolve the real directory before applying managed-prefix checks. Never use
+# sudo or allow an install directory symlink to obscure which files will change.
+case "$install_dir" in
+  /*) ;;
+  *) fail "CODEWHALE_INSTALL_DIR must be an absolute path" ;;
+esac
+[ ! -L "$install_dir" ] || fail "install directory is a symlink: $install_dir; choose a fresh user directory"
+mkdir -p "$install_dir" || fail "cannot create $install_dir; choose a writable user directory (no sudo is used)"
+install_dir="$(cd -P "$install_dir" && pwd)"
+case "$install_dir/" in
+  /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/nix/store/*|/gnu/store/*|*/node_modules/*|*/Cellar/*|*/.linuxbrew/*|*/linuxbrew/*|*/.cargo/bin/*)
+    fail "refusing managed/system directory $install_dir; use a fresh user directory"
+    ;;
+esac
+[ -w "$install_dir" ] || fail "$install_dir is not writable; choose a user directory (no sudo is used)"
+
+check_destination() {
+  destination="$1"
+  source="$2"
+  destination_exists=0
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    if [ ! -L "$destination" ] && [ -f "$destination" ] && [ -x "$destination" ] && cmp -s "$source" "$destination"; then
+      destination_exists=1
+      return
+    fi
+    cat >&2 <<EOF
+codewhale install: refusing to replace existing $destination.
+It may be a newer build, another installation, or a symlink. No existing file was changed.
+For an existing direct Codewhale install, run its full path with 'update'.
+To migrate safely from a package manager or mixed installation, create a fresh directory:
+  mkdir -p "\$HOME/.local"
+  codewhale_install_dir="\$(mktemp -d "\$HOME/.local/codewhale-release.XXXXXX")"
+  curl -fsSL https://codewhale.net/install.sh | CODEWHALE_INSTALL_DIR="\$codewhale_install_dir" sh
+  "\$codewhale_install_dir/codewhale" --version
+  export PATH="\$codewhale_install_dir:\$PATH"
+  hash -r
+  command -v codewhale codew
+EOF
+    exit 1
+  fi
+}
+
+# Check every command before publishing any of them. Existing identical release
+# files are an idempotent install; anything different uses the canonical updater.
+check_destination "$install_dir/codewhale" "$tmpdir/codewhale"
+check_destination "$install_dir/codew" "$tmpdir/codew"
+legacy_tui="$install_dir/codewhale-tui"
+if [ -e "$legacy_tui" ] || [ -L "$legacy_tui" ]; then
+  check_destination "$legacy_tui" "$tmpdir/codewhale"
+fi
+
+stage=""
+stage_dir=""
+trap 'rm -rf "$tmpdir"; if [ -n "$stage" ]; then rm -f "$stage"; fi; if [ -n "$stage_dir" ]; then rmdir "$stage_dir"; fi' EXIT INT TERM
+install_binary() {
+  source="$1"
+  destination="$2"
+  # Recheck immediately before publication. Never replace a file another
+  # process created since preflight: linking the staged inode is no-clobber.
+  check_destination "$destination" "$source"
+  if [ "$destination_exists" -eq 1 ]; then
+    say "Already installed: $destination"
+    return
+  fi
+  stage_dir="$(mktemp -d "$install_dir/.codewhale-install.XXXXXX")"
+  stage="$stage_dir/$(basename "$destination")"
+  cp "$source" "$stage"
+  chmod 755 "$stage"
+  # Pass the intended parent as the directory operand. Passing destination
+  # itself would make ln treat a raced-in directory/symlink as a container.
+  ln "$stage" "$install_dir/" || fail "destination appeared during install: $destination; it was not replaced"
+  [ ! -L "$destination" ] && [ -f "$destination" ] && cmp -s "$stage" "$destination" || fail "installed path changed during publication: $destination"
+  rm -f "$stage"
+  rmdir "$stage_dir"
+  stage=""
+  stage_dir=""
+}
+
+install_binary "$tmpdir/codewhale" "$install_dir/codewhale"
+install_binary "$tmpdir/codew" "$install_dir/codew"
+
+say "Installed checksummed release commands:"
+say "  $install_dir/codewhale"
+say "  $install_dir/codew"
+
+say ""
+say "Use this installation: \"$install_dir/codewhale\""
+say "Future updates: \"$install_dir/codewhale\" update"
+for command_name in codewhale codew; do
+  resolved="$(command -v "$command_name" 2>/dev/null || true)"
+  if [ "$resolved" != "$install_dir/$command_name" ]; then
+    say "PATH selects ${resolved:-no $command_name command}; this install is $install_dir/$command_name"
+  fi
+done
+say "To use this directory in the current shell, then verify the commands:"
+say "  export PATH=\"$install_dir:\$PATH\""
+say "  hash -r"
+say "  command -v codewhale codew"
+say "Keep the directory first in your shell profile after verifying it."

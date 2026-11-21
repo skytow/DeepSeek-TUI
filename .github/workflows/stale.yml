@@ -13,7 +13,8 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/stale@v9
+      # Pinned from actions/stale@v10; update deliberately when refreshing the policy.
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93
         with:
           days-before-stale: 14
           days-before-close: 7
@@ -28,7 +29,7 @@ jobs:
             you can share the requested information.
           stale-issue-label: 'stale'
           only-labels: 'needs-info'
-          exempt-issue-labels: 'pinned,keep-open,bug,security'
+          exempt-issue-labels: 'pinned,keep-open,release-blocker,security'
           # Don't touch PRs — `actions/stale` defaults can be aggressive
           # there. We only want it for `needs-info` issues.
           days-before-pr-stale: -1

@@ -1,19 +1,21 @@
 //! Cargo test runner tool: `run_tests`.
 //!
-//! This tool intentionally auto-approves test execution to encourage
-//! frequent verification loops while still scoping execution to the workspace.
+//! `cargo test` runs workspace code, so this tool follows the same explicit
+//! approval policy as the other code-executing tools.
 
 use std::path::Path;
-use std::process::Command;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::cargo_failure_summary::summarize_cargo_failure;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str,
 };
+
+use crate::dependencies::ExternalTool;
 
 const MAX_OUTPUT_CHARS: usize = 40_000;
 
@@ -33,6 +35,10 @@ struct RunTestsOutput {
 impl ToolSpec for RunTestsTool {
     fn name(&self) -> &'static str {
         "run_tests"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
@@ -61,13 +67,14 @@ impl ToolSpec for RunTestsTool {
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        // Tests are encouraged, so avoid gating them behind approval.
-        ApprovalRequirement::Auto
+        // `run_tests` declares `ToolCapability::ExecutesCode` — match the
+        // default approval policy for code-executing tools.
+        ApprovalRequirement::Required
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let all_features = optional_bool(&input, "all_features", false);
-        let extra_args = optional_str(&input, "args")
+        let all_features = optional_bool(&input, "all_features", false)?;
+        let extra_args = optional_str(&input, "args")?
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
@@ -99,14 +106,31 @@ impl ToolSpec for RunTestsTool {
             command: command_str,
         };
 
-        ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
+        let mut tool_result =
+            ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        if let Some(summary) = summarize_cargo_failure(
+            &result.command,
+            &result.stdout,
+            &result.stderr,
+            Some(result.exit_code),
+        ) {
+            tool_result = tool_result.with_metadata(json!({
+                "summary": summary.summary,
+                "cargo_failure_summary": summary.to_metadata_value(),
+            }));
+        }
+        Ok(tool_result)
     }
 }
 
 // === Helpers ===
 
 fn run_cargo(workspace: &Path, args: &[String]) -> Result<std::process::Output, ToolError> {
-    let mut cmd = Command::new("cargo");
+    let Some(mut cmd) = crate::dependencies::Cargo::command() else {
+        return Err(ToolError::not_available(
+            "cargo is not installed or not in PATH",
+        ));
+    };
     cmd.args(args).current_dir(workspace);
     cmd.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -161,7 +185,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::tempdir;
+
+    static NEXT_CARGO_PROJECT: AtomicU64 = AtomicU64::new(0);
 
     fn cargo_available() -> bool {
         Command::new("cargo")
@@ -173,22 +200,34 @@ mod tests {
 
     fn init_cargo_project(root: &Path) -> std::path::PathBuf {
         let project_dir = root.join("project");
+        let package_name = format!(
+            "eval_project_{}_{}",
+            std::process::id(),
+            NEXT_CARGO_PROJECT.fetch_add(1, Ordering::Relaxed)
+        );
         fs::create_dir_all(&project_dir).expect("create project dir");
-        let status = Command::new("cargo")
-            .args([
-                "init",
-                "--lib",
-                "--vcs",
-                "none",
-                "-q",
-                "--name",
-                "eval_project",
-            ])
+        let status = crate::dependencies::Cargo::command()
+            .expect("cargo not found")
+            .args(["init", "--lib", "--vcs", "none", "-q"])
+            .arg("--name")
+            .arg(package_name)
             .current_dir(&project_dir)
             .status()
             .expect("cargo should spawn");
         assert!(status.success(), "cargo init failed");
         project_dir
+    }
+
+    /// `run_tests` is `ToolCapability::ExecutesCode`, so it must follow the
+    /// explicit-approval policy that applies to other code-executing tools.
+    #[test]
+    fn run_tests_requires_user_approval() {
+        let tool = RunTestsTool;
+        assert_eq!(
+            tool.approval_requirement(),
+            ApprovalRequirement::Required,
+            "run_tests must gate cargo test behind user approval"
+        );
     }
 
     #[tokio::test]
@@ -197,6 +236,9 @@ mod tests {
             return;
         }
         let tmp = tempdir().expect("tempdir");
+        // Release jobs commonly export one CARGO_TARGET_DIR for the whole
+        // workspace. Give concurrent nested Cargo fixtures distinct package
+        // identities so their test artifacts cannot replace each other.
         let project_dir = init_cargo_project(tmp.path());
 
         let ctx = ToolContext::new(&project_dir);
@@ -206,7 +248,11 @@ mod tests {
 
         let parsed: RunTestsOutput =
             serde_json::from_str(&result.content).expect("tool result should be json");
-        assert!(parsed.success);
+        assert!(
+            parsed.success,
+            "nested cargo test unexpectedly failed:\n{}",
+            parsed.stderr
+        );
         assert_eq!(parsed.exit_code, 0);
         assert!(parsed.command.contains("cargo test"));
     }
@@ -240,8 +286,23 @@ mod tests {
 
         let parsed: RunTestsOutput =
             serde_json::from_str(&result.content).expect("tool result should be json");
-        assert!(!parsed.success);
+        assert!(
+            !parsed.success,
+            "nested cargo test unexpectedly passed:\nstdout:\n{}\nstderr:\n{}",
+            parsed.stdout, parsed.stderr
+        );
         assert_ne!(parsed.exit_code, 0);
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(
+            metadata["cargo_failure_summary"]["kind"],
+            json!("test_failure")
+        );
+        assert!(
+            metadata["cargo_failure_summary"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Failing tests:")
+        );
     }
 
     #[test]

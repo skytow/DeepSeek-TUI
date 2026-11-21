@@ -20,14 +20,33 @@ use futures_util::future::join_all;
 use tokio::sync::Mutex;
 
 use crate::llm_client::LlmClient;
-use crate::models::{ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage};
+use crate::models::Role;
+use crate::models::{
+    ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage,
+    is_incomplete_stop_reason, stop_reason_detail,
+};
 use crate::repl::runtime::{BatchResp, RpcDispatcher, RpcRequest, RpcResponse, SingleResp};
 use crate::utils::spawn_supervised;
 
+/// Object-safe runtime-model adapter for a working kernel.
+///
+/// The normal turn loop owns a `SharedModelClient`, while the original RLM
+/// bridge predates that boundary and accepts the concrete [`LlmClient`] trait.
+/// Keeping this small adapter here means a persistent kernel follows exactly
+/// the selected model route (including custom providers) without teaching the
+/// kernel about provider transports or falling back to a side channel.
+pub(crate) struct ModelClientRlmAdapter {
+    client: crate::core::model_client::SharedModelClient,
+}
+
+impl ModelClientRlmAdapter {
+    pub(crate) fn new(client: crate::core::model_client::SharedModelClient) -> Self {
+        Self { client }
+    }
+}
+
 /// Per-child completion timeout — same as the previous sidecar default.
 const CHILD_TIMEOUT_SECS: u64 = 120;
-/// Default `max_tokens` for one-shot child completions.
-const DEFAULT_CHILD_MAX_TOKENS: u32 = 4096;
 /// Hard cap on prompts per batch RPC.
 pub const MAX_BATCH: usize = 16;
 
@@ -37,16 +56,59 @@ pub const MAX_BATCH: usize = 16;
 /// The bridge only needs non-streaming completions, so this boxed-future shim
 /// gives tests a clean mock seam without changing the wider provider trait.
 pub(crate) trait RlmLlmClient: Send + Sync {
+    fn effective_route_envelope(
+        &self,
+        requested_model: &str,
+        dispatched_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cost_status::EffectiveRouteEnvelope;
+
+    fn effective_max_output_tokens(&self, requested_model: &str) -> u32;
+
     fn create_message_boxed(
         &self,
         request: MessageRequest,
     ) -> Pin<Box<dyn Future<Output = Result<MessageResponse>> + Send + '_>>;
 }
 
+impl RlmLlmClient for ModelClientRlmAdapter {
+    fn effective_route_envelope(
+        &self,
+        requested_model: &str,
+        dispatched_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cost_status::EffectiveRouteEnvelope {
+        self.client
+            .effective_route_envelope(requested_model, dispatched_at)
+    }
+
+    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
+        self.client.effective_max_output_tokens(requested_model)
+    }
+
+    fn create_message_boxed(
+        &self,
+        request: MessageRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<MessageResponse>> + Send + '_>> {
+        let client = Arc::clone(&self.client);
+        Box::pin(async move { client.create_message(request).await })
+    }
+}
+
 impl<T> RlmLlmClient for T
 where
     T: LlmClient + Send + Sync,
 {
+    fn effective_route_envelope(
+        &self,
+        requested_model: &str,
+        dispatched_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cost_status::EffectiveRouteEnvelope {
+        LlmClient::effective_route_envelope(self, requested_model, dispatched_at)
+    }
+
+    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
+        LlmClient::effective_max_output_tokens(self, requested_model)
+    }
+
     fn create_message_boxed(
         &self,
         request: MessageRequest,
@@ -90,6 +152,12 @@ impl RlmBridge {
         max_tokens: Option<u32>,
         system: Option<String>,
     ) -> SingleResp {
+        let request_route = self
+            .client
+            .effective_route_envelope(&self.child_model, chrono::Utc::now());
+        let route_max_tokens = self
+            .client
+            .effective_max_output_tokens(&request_route.model);
         let request = MessageRequest {
             // The Python helper accepts `model=` for older snippets, but it is
             // intentionally not authoritative. RLM child calls are pinned to
@@ -97,13 +165,16 @@ impl RlmBridge {
             // cannot silently upgrade cheap fanout work to an expensive model.
             model: self.child_model.clone(),
             messages: vec![Message {
-                role: "user".to_string(),
+                role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: prompt,
                     cache_control: None,
                 }],
             }],
-            max_tokens: max_tokens.unwrap_or(DEFAULT_CHILD_MAX_TOKENS),
+            // An explicit RLM helper bound remains authoritative, but the
+            // default is the selected route's ordinary allowance rather than
+            // a hidden 4K ceiling.
+            max_tokens: max_tokens.map_or(route_max_tokens, |limit| limit.min(route_max_tokens)),
             system: system.map(SystemPrompt::Text),
             tools: None,
             tool_choice: None,
@@ -111,8 +182,8 @@ impl RlmBridge {
             thinking: None,
             reasoning_effort: None,
             stream: Some(false),
-            temperature: Some(0.4_f32),
-            top_p: Some(0.9_f32),
+            temperature: None,
+            top_p: None,
         };
 
         let fut = self.client.create_message_boxed(request);
@@ -133,6 +204,21 @@ impl RlmBridge {
                 }
             };
 
+        {
+            let mut u = self.usage.lock().await;
+            super::add_usage_with_prompt_cache(&mut u, &response.usage);
+        }
+
+        if is_incomplete_stop_reason(response.stop_reason.as_deref()) {
+            return SingleResp {
+                text: String::new(),
+                error: Some(format!(
+                    "llm_query response incomplete: provider stop reason `{}`; partial output was not accepted.",
+                    stop_reason_detail(response.stop_reason.as_deref())
+                )),
+            };
+        }
+
         let text = response
             .content
             .iter()
@@ -143,17 +229,16 @@ impl RlmBridge {
             .collect::<Vec<_>>()
             .join("\n");
 
-        {
-            let mut u = self.usage.lock().await;
-            u.input_tokens = u.input_tokens.saturating_add(response.usage.input_tokens);
-            u.output_tokens = u.output_tokens.saturating_add(response.usage.output_tokens);
-        }
-
         SingleResp { text, error: None }
     }
 
-    async fn dispatch_llm_batch(&self, prompts: Vec<String>, _model: Option<String>) -> BatchResp {
-        if let Some(resp) = batch_guard(prompts.len()) {
+    async fn dispatch_llm_batch(
+        &self,
+        prompts: Vec<String>,
+        _model: Option<String>,
+        dependency_mode: Option<String>,
+    ) -> BatchResp {
+        if let Some(resp) = batch_guard(prompts.len(), dependency_mode.as_deref()) {
             return resp;
         }
 
@@ -209,8 +294,7 @@ impl RlmBridge {
 
         {
             let mut u = self.usage.lock().await;
-            u.input_tokens = u.input_tokens.saturating_add(result.usage.input_tokens);
-            u.output_tokens = u.output_tokens.saturating_add(result.usage.output_tokens);
+            super::add_usage_with_prompt_cache(&mut u, &result.usage);
         }
 
         SingleResp {
@@ -219,8 +303,13 @@ impl RlmBridge {
         }
     }
 
-    async fn dispatch_rlm_batch(&self, prompts: Vec<String>, _model: Option<String>) -> BatchResp {
-        if let Some(resp) = batch_guard(prompts.len()) {
+    async fn dispatch_rlm_batch(
+        &self,
+        prompts: Vec<String>,
+        _model: Option<String>,
+        dependency_mode: Option<String>,
+    ) -> BatchResp {
+        if let Some(resp) = batch_guard(prompts.len(), dependency_mode.as_deref()) {
             return resp;
         }
 
@@ -233,7 +322,7 @@ impl RlmBridge {
     }
 }
 
-fn batch_guard(prompt_count: usize) -> Option<BatchResp> {
+fn batch_guard(prompt_count: usize, dependency_mode: Option<&str>) -> Option<BatchResp> {
     if prompt_count == 0 {
         return Some(BatchResp { results: vec![] });
     }
@@ -243,6 +332,27 @@ fn batch_guard(prompt_count: usize) -> Option<BatchResp> {
                 .map(|_| SingleResp {
                     text: String::new(),
                     error: Some(format!("batch too large: {prompt_count} > {MAX_BATCH}")),
+                })
+                .collect(),
+        });
+    }
+    let mode = dependency_mode
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    if !matches!(
+        mode.as_str(),
+        "independent" | "parallel_safe" | "map_reduce"
+    ) {
+        return Some(BatchResp {
+            results: (0..prompt_count)
+                .map(|_| SingleResp {
+                    text: String::new(),
+                    error: Some(
+                        "batch requires dependency_mode='independent'; use sub_query_sequence or sequential sub_query calls for dependent work"
+                            .to_string(),
+                    ),
                 })
                 .collect(),
         });
@@ -265,15 +375,27 @@ impl RpcDispatcher for RlmBridge {
                 } => {
                     RpcResponse::Single(self.dispatch_llm(prompt, model, max_tokens, system).await)
                 }
-                RpcRequest::LlmBatch { prompts, model } => {
-                    RpcResponse::Batch(self.dispatch_llm_batch(prompts, model).await)
-                }
+                RpcRequest::LlmBatch {
+                    prompts,
+                    model,
+                    dependency_mode,
+                    safety_note: _,
+                } => RpcResponse::Batch(
+                    self.dispatch_llm_batch(prompts, model, dependency_mode)
+                        .await,
+                ),
                 RpcRequest::Rlm { prompt, model } => {
                     RpcResponse::Single(self.dispatch_rlm(prompt, model).await)
                 }
-                RpcRequest::RlmBatch { prompts, model } => {
-                    RpcResponse::Batch(self.dispatch_rlm_batch(prompts, model).await)
-                }
+                RpcRequest::RlmBatch {
+                    prompts,
+                    model,
+                    dependency_mode,
+                    safety_note: _,
+                } => RpcResponse::Batch(
+                    self.dispatch_rlm_batch(prompts, model, dependency_mode)
+                        .await,
+                ),
             }
         })
     }
@@ -284,7 +406,7 @@ mod tests {
     use super::*;
     use crate::llm_client::mock::MockLlmClient;
 
-    fn mock_response(text: &str, input_tokens: u32, output_tokens: u32) -> MessageResponse {
+    fn mock_response_with_usage(text: &str, usage: Usage) -> MessageResponse {
         MessageResponse {
             id: "mock_msg".to_string(),
             r#type: "message".to_string(),
@@ -297,12 +419,19 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
             stop_sequence: None,
             container: None,
-            usage: Usage {
+            usage,
+        }
+    }
+
+    fn mock_response(text: &str, input_tokens: u32, output_tokens: u32) -> MessageResponse {
+        mock_response_with_usage(
+            text,
+            Usage {
                 input_tokens,
                 output_tokens,
                 ..Usage::default()
             },
-        }
+        )
     }
 
     fn bridge_for(mock: Arc<MockLlmClient>, depth_remaining: u32) -> RlmBridge {
@@ -312,18 +441,19 @@ mod tests {
 
     #[test]
     fn batch_guard_allows_non_empty_batches_at_the_cap() {
-        assert!(batch_guard(MAX_BATCH).is_none());
+        assert!(batch_guard(MAX_BATCH, Some("independent")).is_none());
     }
 
     #[test]
     fn batch_guard_returns_empty_response_for_empty_batches() {
-        let response = batch_guard(0).expect("empty batch should be handled");
+        let response = batch_guard(0, None).expect("empty batch should be handled");
         assert!(response.results.is_empty());
     }
 
     #[test]
     fn batch_guard_returns_one_error_per_oversized_prompt() {
-        let response = batch_guard(MAX_BATCH + 2).expect("oversized batch should be handled");
+        let response = batch_guard(MAX_BATCH + 2, Some("independent"))
+            .expect("oversized batch should be handled");
         assert_eq!(response.results.len(), MAX_BATCH + 2);
         assert!(response.results.iter().all(|result| {
             result.text.is_empty()
@@ -331,6 +461,28 @@ mod tests {
                     .error
                     .as_deref()
                     .is_some_and(|err| err.contains("batch too large"))
+        }));
+    }
+
+    #[test]
+    fn batch_guard_requires_explicit_independence_for_parallel_work() {
+        let response = batch_guard(2, None).expect("missing dependency mode should be handled");
+        assert_eq!(response.results.len(), 2);
+        assert!(response.results.iter().all(|result| {
+            result.text.is_empty()
+                && result
+                    .error
+                    .as_deref()
+                    .is_some_and(|err| err.contains("dependency_mode='independent'"))
+        }));
+
+        let response = batch_guard(2, Some("sequential"))
+            .expect("dependent dependency mode should be handled");
+        assert!(response.results.iter().all(|result| {
+            result
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("sub_query_sequence"))
         }));
     }
 
@@ -372,6 +524,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_dispatch_preserves_prompt_cache_usage() {
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        mock.push_message_response(mock_response_with_usage(
+            "cached child answer",
+            Usage {
+                input_tokens: 1000,
+                output_tokens: 100,
+                prompt_cache_hit_tokens: Some(800),
+                prompt_cache_miss_tokens: Some(200),
+                ..Usage::default()
+            },
+        ));
+        let bridge = bridge_for(Arc::clone(&mock), 1);
+
+        let response = bridge
+            .dispatch(RpcRequest::Llm {
+                prompt: "child prompt".to_string(),
+                model: None,
+                max_tokens: None,
+                system: None,
+            })
+            .await;
+
+        match response {
+            RpcResponse::Single(single) => {
+                assert_eq!(single.text, "cached child answer");
+                assert!(single.error.is_none());
+            }
+            other => panic!("expected single response, got {other:?}"),
+        }
+
+        let usage = bridge.usage.lock().await;
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(800));
+        assert_eq!(usage.prompt_cache_miss_tokens, Some(200));
+    }
+
+    #[tokio::test]
+    async fn llm_dispatch_rejects_max_tokens_partial_output_after_charging_usage() {
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        let usage = Usage {
+            input_tokens: 23,
+            output_tokens: 4096,
+            reasoning_tokens: Some(4000),
+            ..Usage::default()
+        };
+        let mut response = mock_response_with_usage(
+            "FINAL('partial answer')\n```repl\nFINAL('also partial')\n```",
+            usage.clone(),
+        );
+        response.stop_reason = Some("max_tokens".to_string());
+        mock.push_message_response(response);
+        let bridge = bridge_for(Arc::clone(&mock), 1);
+
+        let response = bridge
+            .dispatch(RpcRequest::Llm {
+                prompt: "child prompt".to_string(),
+                model: None,
+                max_tokens: None,
+                system: None,
+            })
+            .await;
+
+        match response {
+            RpcResponse::Single(single) => {
+                assert!(
+                    single.text.is_empty(),
+                    "partial output must not be accepted"
+                );
+                let error = single.error.expect("truncation must surface as an error");
+                assert!(error.contains("incomplete"), "{error}");
+                assert!(error.contains("max_tokens"), "{error}");
+            }
+            other => panic!("expected single response, got {other:?}"),
+        }
+
+        assert_eq!(*bridge.usage.lock().await, usage);
+        assert_eq!(mock.call_count(), 1, "truncation must not retry");
+    }
+
+    #[tokio::test]
     async fn llm_batch_dispatch_pins_configured_child_model() {
         let mock = Arc::new(MockLlmClient::new(Vec::new()));
         mock.push_message_response(mock_response("one", 1, 2));
@@ -383,6 +617,8 @@ mod tests {
             .dispatch(RpcRequest::LlmBatch {
                 prompts: vec!["a".to_string(), "b".to_string(), "c".to_string()],
                 model: Some("batch-model".to_string()),
+                dependency_mode: Some("independent".to_string()),
+                safety_note: Some("test prompts are independent".to_string()),
             })
             .await;
 
