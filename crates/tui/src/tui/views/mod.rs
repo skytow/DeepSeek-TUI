@@ -136,6 +136,10 @@ pub enum ViewEvent {
         effort: crate::tui::app::ReasoningEffort,
         previous_model: String,
         previous_effort: crate::tui::app::ReasoningEffort,
+        /// When the picker row belongs to a different provider than the
+        /// active one, the handler must switch providers before applying
+        /// the model. `None` means "leave provider as-is".
+        provider: Option<crate::config::ApiProvider>,
     },
     /// Emitted by the `/provider` picker when the user selects a provider
     /// that already has credentials — the handler should perform the same

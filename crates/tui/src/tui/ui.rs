@@ -3926,16 +3926,43 @@ async fn drain_web_config_events(
 /// a one-line status describing what changed.
 async fn apply_model_picker_choice(
     app: &mut App,
-    engine_handle: &EngineHandle,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
     model: String,
     mut effort: crate::tui::app::ReasoningEffort,
     previous_model: String,
     previous_effort: crate::tui::app::ReasoningEffort,
+    provider: Option<ApiProvider>,
 ) {
     let model_is_auto = model.trim().eq_ignore_ascii_case("auto");
     if model_is_auto {
         effort = ReasoningEffort::Auto;
     }
+
+    // Cross-provider pick: switch_provider does the heavy lifting (engine
+    // restart, session sync, model swap). It does not persist to config.toml,
+    // so this branch is session-scoped — match the existing /provider
+    // command's semantics rather than silently writing a half-state.
+    if let Some(target) = provider.filter(|p| *p != app.api_provider) {
+        switch_provider(app, engine_handle, config, target, Some(model.clone())).await;
+        let effort_changed = effort != app.reasoning_effort;
+        if effort_changed {
+            app.reasoning_effort = effort;
+            app.last_effective_reasoning_effort = None;
+        }
+        let suffix = if matches!(target, ApiProvider::Deepseek) {
+            String::new()
+        } else {
+            " (session-scoped — edit ~/.deepseek/config.toml to persist)".to_string()
+        };
+        app.status_message = Some(format!(
+            "Switched to {} · {}{suffix}",
+            target.display_name(),
+            model
+        ));
+        return;
+    }
+
     let model_changed = model != previous_model || app.auto_model != model_is_auto;
     let effort_changed = effort != previous_effort;
     if !model_changed && !effort_changed {
@@ -4530,8 +4557,21 @@ async fn apply_command_result(
             }
             AppAction::OpenModelPicker => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
+                    use crate::tui::model_picker;
+                    // Local + library go over the network; do them in
+                    // parallel. Cloud is a synchronous file read.
+                    let cloud = model_picker::discover_user_cloud_models(config);
+                    let (local, library) = tokio::join!(
+                        model_picker::fetch_ollama_local(),
+                        model_picker::fetch_ollama_library(),
+                    );
+                    let sources = model_picker::OllamaSources {
+                        local,
+                        cloud,
+                        library,
+                    };
                     app.view_stack
-                        .push(crate::tui::model_picker::ModelPickerView::new(app));
+                        .push(model_picker::ModelPickerView::new(app, sources));
                 }
             }
             AppAction::OpenProviderPicker => {
@@ -5686,14 +5726,17 @@ async fn handle_view_events(
                 effort,
                 previous_model,
                 previous_effort,
+                provider,
             } => {
                 apply_model_picker_choice(
                     app,
                     engine_handle,
+                    config,
                     model,
                     effort,
                     previous_model,
                     previous_effort,
+                    provider,
                 )
                 .await;
             }

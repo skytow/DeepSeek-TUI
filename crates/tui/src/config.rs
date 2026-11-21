@@ -1007,6 +1007,11 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub http_headers: Option<HashMap<String, String>>,
+    /// Ollama-only: extra cloud-hosted model ids (e.g. `glm-5:cloud`)
+    /// to surface in the `/model` picker's Cloud section. Ignored for
+    /// other providers. There is no public listing API for Ollama Cloud,
+    /// so this is the canonical place to declare them explicitly.
+    pub cloud_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2471,6 +2476,7 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         base_url: override_cfg.base_url.or(base.base_url),
         model: override_cfg.model.or(base.model),
         http_headers: override_cfg.http_headers.or(base.http_headers),
+        cloud_models: override_cfg.cloud_models.or(base.cloud_models),
     }
 }
 
